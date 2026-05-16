@@ -2,8 +2,14 @@
 
 from flask import Blueprint, request, jsonify
 from services.order_service import OrderService
+import traceback
+import logging  # ← add
+
+logger = logging.getLogger(__name__)  # ← add
 
 confirm_order_bp = Blueprint("confirm_order", __name__)
+order_service = OrderService()
+
 
 order_service = OrderService()
 
@@ -54,7 +60,7 @@ def confirm_order():
         return jsonify(result), status_code
 
     except Exception as e:
-        # Catch unexpected errors to avoid crashing the server
+        logger.error("confirm_order failed: %s\n%s", str(e), traceback.format_exc())  # ← add
         return jsonify({
             "error": "An unexpected error occurred during order confirmation.",
             "details": str(e)
