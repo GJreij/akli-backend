@@ -13,7 +13,10 @@ from utils.supabase_client import supabase
 # =============================================================================
 
 # Tolerance ladder: solver tries each in order, first feasible wins.
-KCAL_TOLERANCES = [0.08, 0.10, 0.15, 0.20, 0.40]
+KCAL_TOLERANCES  = [0.08, 0.10, 0.15, 0.20, 0.40]
+# Paired macro tolerance ladder — slightly wider than kcal since individual
+# macros are harder to hit exactly with discrete integer servings.
+MACRO_TOLERANCES = [0.12, 0.15, 0.20, 0.30, 0.40]
 
 # Half-step granularity tried after integer step fails for each tolerance.
 SERVING_STEP_FINE = 0.5
@@ -27,16 +30,14 @@ SERVING_MIN_BY_STEP = {
 DEFAULT_MAX_SERVING = 3
 
 # Meal-type kcal distribution caps (relative to TOTAL solved kcal, not target).
-BREAKFAST_MAX_PCT   = 0.40
-SNACK_MAX_PCT       = 0.25
-DINNER_LUNCH_DIFF_PCT = 0.40   # |dinner - lunch| / smaller <= 30%
-NO_DINNER_YES_LUNCH_PCT = 0.60
-NO_LUNCH_YES_DINNER_PCT = 0.60
+BREAKFAST_MAX_PCT        = 0.40
+SNACK_MAX_PCT            = 0.25
+DINNER_LUNCH_DIFF_PCT    = 0.40   # |dinner - lunch| / smaller <= 40%
+NO_DINNER_YES_LUNCH_PCT  = 0.60
+NO_LUNCH_YES_DINNER_PCT  = 0.60
 
 # Objective weights — all expressed as fractions of their macro targets,
 # so a 10 g overshoot on protein is equally bad as 10 g on carbs (percentage-wise).
-# Tweak WEIGHT_KCAL_SOFT to control how hard the solver pushes toward the kcal
-# bull's-eye beyond the hard band enforced by the tolerance constraint.
 WEIGHT_PROTEIN   = 1.0
 WEIGHT_CARBS     = 1.0
 WEIGHT_FAT       = 1.0
@@ -119,10 +120,10 @@ def _build_result(
         })
 
     day_totals = {
-        "protein":       int(round(totals["protein"])),
-        "carbs":         int(round(totals["carbs"])),
-        "fat":           int(round(totals["fat"])),
-        "kcal":          int(round(totals["kcal"])),
+        "protein":        int(round(totals["protein"])),
+        "carbs":          int(round(totals["carbs"])),
+        "fat":            int(round(totals["fat"])),
+        "kcal":           int(round(totals["kcal"])),
         "tolerance_used": tolerance_label,
     }
 
@@ -201,28 +202,25 @@ def _solve_lp_once(
     kcal_t: float,
     serving_step: float,
     tol: float,
+    macro_tol: float,
     allow_under_kcal: bool,
 ) -> Tuple[List[Dict], float, Dict] | None:
     """
     Build and solve one LP instance.
 
-    Key design decisions vs. the old version
-    -----------------------------------------
-    1. Objective is PERCENTAGE-normalised:
-         min  dev_P/P_t + dev_C/C_t + dev_F/F_t + w_K * dev_K/kcal_t
-       This prevents the solver from systematically over-shooting protein
-       just because protein targets are numerically smaller than carb targets.
+    Key design decisions
+    --------------------
+    1. Objective is PERCENTAGE-normalised to prevent the solver from trading
+       one macro for another based on absolute gram differences.
 
-    2. Kcal deviation (dev_K) is soft-penalised inside the objective AND
-       hard-bounded by the tolerance band.  This keeps the solver centred
-       around kcal_t without blowing up feasibility.
+    2. Kcal deviation is soft-penalised in the objective AND hard-bounded by
+       the tolerance band.
 
-    3. Meal-type distribution caps are expressed relative to total_K
-       (the LP variable), not the fixed target kcal_t.  When the solver
-       drifts slightly above/below kcal_t the proportions stay meaningful.
+    3. Protein, carbs, and fat each have their own hard band (macro_tol),
+       so the solver cannot satisfy kcal while leaving any individual macro
+       far from its target.
 
-    4. The meal-type branching uses a proper elif chain, preventing
-       multiple conflicting constraint blocks from firing simultaneously.
+    4. Meal-type distribution caps are relative to total_K (not fixed kcal_t).
 
     Returns None if the LP is infeasible or non-optimal.
     """
@@ -293,9 +291,9 @@ def _solve_lp_once(
     safe_K = max(kcal_t, 1.0)
 
     prob += (
-        WEIGHT_PROTEIN   * (dev_P / safe_P)
-        + WEIGHT_CARBS   * (dev_C / safe_C)
-        + WEIGHT_FAT     * (dev_F / safe_F)
+        WEIGHT_PROTEIN     * (dev_P / safe_P)
+        + WEIGHT_CARBS     * (dev_C / safe_C)
+        + WEIGHT_FAT       * (dev_F / safe_F)
         + WEIGHT_KCAL_SOFT * (dev_K / safe_K)
     )
 
@@ -307,10 +305,26 @@ def _solve_lp_once(
         prob += total_K >= (1.0 - tol) * kcal_t
 
     # ------------------------------------------------------------------
+    # Hard per-macro band constraints
+    # Unlike kcal, macros are only soft in the objective above, which lets
+    # the solver hit kcal while ignoring individual macros. These hard bounds
+    # force all three macros to land within macro_tol of their targets.
+    # ------------------------------------------------------------------
+    if P_t > 0:
+        prob += total_P >= (1.0 - macro_tol) * P_t
+        prob += total_P <= (1.0 + macro_tol) * P_t
+    if C_t > 0:
+        prob += total_C >= (1.0 - macro_tol) * C_t
+        prob += total_C <= (1.0 + macro_tol) * C_t
+    if F_t > 0:
+        prob += total_F >= (1.0 - macro_tol) * F_t
+        prob += total_F <= (1.0 + macro_tol) * F_t
+
+    # ------------------------------------------------------------------
     # Meal-type kcal distribution constraints
     # Caps are relative to total_K (not the fixed kcal_t) so they stay
     # proportionally meaningful when the solver drifts within the band.
-    # Uses a single elif chain to avoid multiple blocks firing at once.
+    # Uses a single elif chain to avoid multiple conflicting blocks.
     # ------------------------------------------------------------------
     kcal_by_type: Dict[str, Any] = defaultdict(int)
     for i, s in enumerate(all_subs):
@@ -381,18 +395,18 @@ def _solve_lp_once(
     }
 
     total_error = float(value(
-        WEIGHT_PROTEIN   * (dev_P / safe_P)
-        + WEIGHT_CARBS   * (dev_C / safe_C)
-        + WEIGHT_FAT     * (dev_F / safe_F)
+        WEIGHT_PROTEIN     * (dev_P / safe_P)
+        + WEIGHT_CARBS     * (dev_C / safe_C)
+        + WEIGHT_FAT       * (dev_F / safe_F)
         + WEIGHT_KCAL_SOFT * (dev_K / safe_K)
     ))
 
     day_totals = {
-        "protein":          int(round(value(total_P))),
-        "carbs":            int(round(value(total_C))),
-        "fat":              int(round(value(total_F))),
-        "kcal":             int(round(value(total_K))),
-        "tolerance_used":   tol,
+        "protein":           int(round(value(total_P))),
+        "carbs":             int(round(value(total_C))),
+        "fat":               int(round(value(total_F))),
+        "kcal":              int(round(value(total_K))),
+        "tolerance_used":    tol,
         "serving_step_used": serving_step,
     }
 
@@ -472,10 +486,10 @@ def optimize_subrecipes(
     # ------------------------------------------------------------------
     # 2. Resolve targets
     # ------------------------------------------------------------------
-    P_t     = float(macro_target.get("protein_g") or 0.0)
-    C_t     = float(macro_target.get("carbs_g")   or 0.0)
-    F_t     = float(macro_target.get("fat_g")     or 0.0)
-    kcal_t  = float(macro_target.get("kcal")      or (4.0 * (P_t + C_t) + 9.0 * F_t))
+    P_t    = float(macro_target.get("protein_g") or 0.0)
+    C_t    = float(macro_target.get("carbs_g")   or 0.0)
+    F_t    = float(macro_target.get("fat_g")     or 0.0)
+    kcal_t = float(macro_target.get("kcal")      or (4.0 * (P_t + C_t) + 9.0 * F_t))
 
     # Guard: if all targets are zero we have nothing to optimise.
     if kcal_t <= 0:
@@ -484,9 +498,9 @@ def optimize_subrecipes(
         )
 
     # ------------------------------------------------------------------
-    # 3. Tolerance ladder: for each tolerance try integer step, then half-step.
+    # 3. Tolerance ladder: paired kcal + macro tolerances, integer then half-step.
     # ------------------------------------------------------------------
-    for tol in KCAL_TOLERANCES:
+    for tol, macro_tol in zip(KCAL_TOLERANCES, MACRO_TOLERANCES):
         for step in (1.0, SERVING_STEP_FINE):
             result = _solve_lp_once(
                 all_subs=all_subs,
@@ -497,6 +511,7 @@ def optimize_subrecipes(
                 kcal_t=kcal_t,
                 serving_step=step,
                 tol=tol,
+                macro_tol=macro_tol,
                 allow_under_kcal=allow_under_kcal,
             )
             if result is not None:

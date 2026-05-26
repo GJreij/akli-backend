@@ -23,6 +23,11 @@ RECENT_GLOBAL_MAXLEN          = 10
 MEAL_HISTORY_MAXLEN           = 20
 POPULARITY_CAP                = 50   # orders at which a recipe hits max popularity score
 
+# Macro compatibility scoring — rewards recipes whose energy ratio (protein %,
+# carbs %, fat %) matches the user's daily macro target split.
+MACRO_COMPAT_WEIGHT      = 3.0   # scale: +1.5 perfect match → −1.5 at diff=1.0
+MACRO_COMPAT_HARD_FILTER = -2.5  # recipes scoring below this are excluded pre-LP
+
 
 # =============================================================================
 # HELPERS
@@ -143,6 +148,74 @@ def prefetch_weekday_popularity(recipe_ids: list, weekdays: list) -> dict:
     }
 
 
+def prefetch_recipe_macros(recipe_ids: list) -> dict:
+    """
+    Returns { recipe_id: { protein, carbs, fat, kcal } } summed across all
+    subrecipes at 1 serving each. Used for macro-compatibility scoring.
+    The macro energy ratio (protein%/carbs%/fat%) is scale-invariant, so
+    1-serving aggregates are sufficient for direction/ratio comparisons.
+    """
+    if not recipe_ids:
+        return {}
+
+    resp = (
+        supabase.table("recipe_subrecipe")
+        .select("recipe_id, subrecipe(kcal, protein, carbs, fat)")
+        .in_("recipe_id", recipe_ids)
+        .execute()
+    )
+
+    totals: dict = defaultdict(lambda: {"protein": 0.0, "carbs": 0.0, "fat": 0.0, "kcal": 0.0})
+    for rs in (resp.data or []):
+        rid = rs.get("recipe_id")
+        sub = rs.get("subrecipe") or {}
+        if rid is None:
+            continue
+        totals[rid]["protein"] += float(sub.get("protein") or 0)
+        totals[rid]["carbs"]   += float(sub.get("carbs")   or 0)
+        totals[rid]["fat"]     += float(sub.get("fat")     or 0)
+        totals[rid]["kcal"]    += float(sub.get("kcal")    or 0)
+
+    return dict(totals)
+
+
+# =============================================================================
+# MACRO COMPATIBILITY SCORING
+# =============================================================================
+
+def _macro_compat_score(recipe_id: int, recipe_macros: dict, macro_target: dict) -> float:
+    """
+    Returns a score bonus/penalty based on how closely a recipe's macro energy
+    ratio (protein%/carbs%/fat% of kcal) matches the user's daily target split.
+
+    The ratio is scale-invariant — serving adjustments cannot fix a bad ratio,
+    so this score is a reliable signal of LP solvability for this recipe.
+
+    Returns 0.0 if macro data is missing (neutral, no penalty).
+    Score range: roughly +1.5 (perfect match) to -3.5 (completely opposite).
+    """
+    m = recipe_macros.get(recipe_id)
+    if not m or m.get("kcal", 0) <= 0:
+        return 0.0
+
+    kcal     = max(m["kcal"], 1.0)
+    tgt_kcal = max(macro_target.get("kcal", 1.0), 1.0)
+
+    rec_p = (m["protein"] * 4) / kcal
+    rec_c = (m["carbs"]   * 4) / kcal
+    rec_f = (m["fat"]     * 9) / kcal
+
+    tgt_p = (macro_target.get("protein_g", 0) * 4) / tgt_kcal
+    tgt_c = (macro_target.get("carbs_g",   0) * 4) / tgt_kcal
+    tgt_f = (macro_target.get("fat_g",     0) * 9) / tgt_kcal
+
+    # Sum of absolute differences in macro energy fractions (range 0–2).
+    diff = abs(rec_p - tgt_p) + abs(rec_c - tgt_c) + abs(rec_f - tgt_f)
+
+    # Map: diff=0 → +1.5, diff=0.5 → 0, diff=1.0 → -1.5, diff≥1.33 → ≤ -2.5
+    return MACRO_COMPAT_WEIGHT * (0.5 - diff)
+
+
 # =============================================================================
 # RECIPE SCORING  (pure in-memory - zero DB calls)
 # =============================================================================
@@ -156,6 +229,8 @@ def composite_score(
     flex_stats:           dict,
     categories:           dict,
     popularity:           dict,
+    recipe_macros:        dict,
+    macro_target:         dict,
 ) -> float:
     """
     Scores a recipe for a meal slot on a specific day. Higher = more likely chosen.
@@ -164,6 +239,7 @@ def composite_score(
       + user like bonus
       + flex bonus            - LP optimizer friendliness
       + weekday popularity    - historical ordering patterns
+      + macro compatibility   - reward recipes whose macro ratio matches target
       - user dislike penalty
       - category overlap      - semantic day-to-day variety
       - same recipe yesterday - hard discourage (not hard block)
@@ -181,6 +257,9 @@ def composite_score(
     score += FLEX_SUM_MAX_WEIGHT   * flex["sum_max"]
 
     score += WEEKDAY_POPULARITY_WEIGHT * popularity.get((rid, weekday), 0.5)
+
+    # Reward recipes whose macro energy ratio matches the user's daily target.
+    score += _macro_compat_score(rid, recipe_macros, macro_target)
 
     today_cats = categories.get(rid, frozenset())
     score -= CATEGORY_OVERLAP_PENALTY * len(today_cats & yesterday_categories)
@@ -233,6 +312,8 @@ def build_day_candidate(
     flex_stats:           dict,
     categories:           dict,
     popularity:           dict,
+    recipe_macros:        dict,
+    macro_target:         dict,
 ) -> dict | None:
     """
     Builds one full-day candidate. Two-pass per slot:
@@ -258,6 +339,11 @@ def build_day_candidate(
                     continue
                 if strict and (rid in recent_global or rid in meal_hist):
                     continue
+                # Hard filter: skip recipes extremely incompatible with the
+                # macro target — their energy ratio can't be fixed by serving
+                # adjustments, so they will make the LP harder to solve.
+                if _macro_compat_score(rid, recipe_macros, macro_target) < MACRO_COMPAT_HARD_FILTER:
+                    continue
                 sc = composite_score(
                     recipe=r,
                     weekday=weekday,
@@ -267,6 +353,8 @@ def build_day_candidate(
                     flex_stats=flex_stats,
                     categories=categories,
                     popularity=popularity,
+                    recipe_macros=recipe_macros,
+                    macro_target=macro_target,
                 )
                 pairs.append((r, sc))
             return pairs
@@ -306,6 +394,8 @@ def get_or_create_daily_template(
     flex_stats:           dict,
     categories:           dict,
     popularity:           dict,
+    recipe_macros:        dict,
+    macro_target:         dict,
     best_tries:           int = BEST_DAY_TRIES_DEFAULT,
 ) -> dict | None:
     """
@@ -364,6 +454,9 @@ def get_or_create_daily_template(
                     continue
                 if user_prefs.get(rid, {}).get("dont_include"):
                     continue
+                # Apply same macro compatibility hard filter for swapped slots.
+                if _macro_compat_score(rid, recipe_macros, macro_target) < MACRO_COMPAT_HARD_FILTER:
+                    continue
                 sc = composite_score(
                     recipe=r,
                     weekday=weekday,
@@ -373,6 +466,8 @@ def get_or_create_daily_template(
                     flex_stats=flex_stats,
                     categories=categories,
                     popularity=popularity,
+                    recipe_macros=recipe_macros,
+                    macro_target=macro_target,
                 )
                 pairs.append((r, sc))
 
@@ -410,6 +505,8 @@ def get_or_create_daily_template(
             flex_stats=flex_stats,
             categories=categories,
             popularity=popularity,
+            recipe_macros=recipe_macros,
+            macro_target=macro_target,
         )
         if not candidate:
             continue
@@ -648,9 +745,9 @@ def generate_meal_plan():
         return jsonify({"error": "No diet set, we're working on it!"}), 400
 
     t         = macro_resp.data[0]
-    protein_g = float(t.get("protein_g")  or 0)
-    carbs_g   = float(t.get("carbs_g")    or 0)
-    fat_g     = float(t.get("fat_g")      or 0)
+    protein_g = float(t.get("protein_g")   or 0)
+    carbs_g   = float(t.get("carbs_g")     or 0)
+    fat_g     = float(t.get("fat_g")       or 0)
     kcal_t    = float(t.get("kcal_target") or (4 * (protein_g + carbs_g) + 9 * fat_g))
     target_with_kcal = {
         "protein_g": protein_g,
@@ -665,9 +762,10 @@ def generate_meal_plan():
     all_recipe_ids  = [r["id"] for r in all_recipes]
     active_weekdays = list({d.weekday() for d in available_dates})
 
-    flex_stats  = prefetch_flex_stats(all_recipe_ids)
-    categories  = prefetch_categories(all_recipe_ids)
-    popularity  = prefetch_weekday_popularity(all_recipe_ids, active_weekdays)
+    flex_stats    = prefetch_flex_stats(all_recipe_ids)
+    categories    = prefetch_categories(all_recipe_ids)
+    popularity    = prefetch_weekday_popularity(all_recipe_ids, active_weekdays)
+    recipe_macros = prefetch_recipe_macros(all_recipe_ids)
 
     # ------------------------------------------------------------------
     # 10. Generate plan - sequential, day-aware
@@ -697,6 +795,8 @@ def generate_meal_plan():
             flex_stats=flex_stats,
             categories=categories,
             popularity=popularity,
+            recipe_macros=recipe_macros,
+            macro_target=target_with_kcal,
             best_tries=BEST_TRIES,
         )
 
