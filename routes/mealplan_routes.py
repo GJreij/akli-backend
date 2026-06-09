@@ -24,6 +24,16 @@ RECENT_GLOBAL_MAXLEN          = 10
 MEAL_HISTORY_MAXLEN           = 20
 POPULARITY_CAP                = 50   # orders at which a recipe hits max popularity score
 
+# Shared daily template is regenerated if it is older than this many days.
+# Prevents stale recipe combinations from being served to new clients.
+TEMPLATE_TTL_DAYS = 7
+
+# Users whose daily kcal target exceeds this bypass the shared daily_menu
+# template entirely and always receive a fresh personalised day.
+# High-calorie targets (athletes, bulking) are incompatible with an
+# average-target template, so sharing it makes the LP harder to satisfy.
+HIGH_KCAL_THRESHOLD = 2800
+
 # Macro compatibility scoring — rewards recipes whose energy ratio (protein %,
 # carbs %, fat %) matches the user's daily macro target split.
 MACRO_COMPAT_WEIGHT      = 3.0   # scale: +1.5 perfect match → −1.5 at diff=1.0
@@ -281,10 +291,19 @@ def weighted_choice_by_score(candidates: list, scores: list) -> dict:
     return random.choices(candidates, weights=weights, k=1)[0]
 
 
-def score_day(recipes_by_meal: dict, flex_stats: dict) -> float:
+def score_day(
+    recipes_by_meal: dict,
+    flex_stats:      dict,
+    recipe_macros:   dict | None = None,
+    macro_target:    dict | None = None,
+) -> float:
     """
     Scores a full-day combination by LP optimizer friendliness.
-    Rewards more subrecipes/headroom, penalizes single-subrecipe meals.
+    Rewards more subrecipes/headroom, penalises single-subrecipe meals.
+    When recipe_macros and macro_target are supplied, also applies a
+    proportional penalty for days whose max-achievable kcal falls short
+    of the calorie target — these days will fail the LP pre-feasibility
+    check and should be de-prioritised during candidate selection.
     """
     total_sub, total_sum_max, single_sub_meals = 0, 0, 0
     for info in recipes_by_meal.values():
@@ -293,7 +312,27 @@ def score_day(recipes_by_meal: dict, flex_stats: dict) -> float:
         total_sum_max += flex["sum_max"]
         if flex["sub_count"] <= 1:
             single_sub_meals += 1
-    return (10.0 * total_sub) + (1.5 * total_sum_max) - (12.0 * single_sub_meals)
+
+    base = (10.0 * total_sub) + (1.5 * total_sum_max) - (12.0 * single_sub_meals)
+
+    # Feasibility penalty: estimate max achievable kcal for this day.
+    # recipe_macros[rid]["kcal"] = kcal at 1 serving of each subrecipe.
+    # Scaling by avg_max_serving (sum_max / sub_count) gives a proportional
+    # upper bound. Days that structurally cannot reach the target are penalised
+    # proportionally (up to -50 for a day that reaches 0% of the target).
+    if recipe_macros and macro_target:
+        kcal_t = macro_target.get("kcal", 0.0)
+        if kcal_t > 0:
+            est_max_kcal = 0.0
+            for info in recipes_by_meal.values():
+                rid  = int(info["recipe_id"])
+                flex = flex_stats.get(rid, {"sub_count": 1, "sum_max": 3})
+                avg_max = flex["sum_max"] / max(flex["sub_count"], 1)
+                est_max_kcal += recipe_macros.get(rid, {}).get("kcal", 0.0) * avg_max
+            shortfall = max(0.0, 1.0 - est_max_kcal / kcal_t)
+            base -= 50.0 * shortfall
+
+    return base
 
 
 # =============================================================================
@@ -408,13 +447,39 @@ def get_or_create_daily_template(
     If no template: run best_tries candidates, pick the highest-scoring day,
     persist it so all clients on the same kitchen share the same base.
     """
-    resp = (
-        supabase.table("daily_menu")
-        .select("meal_type, recipe_id")
-        .eq("date", str(date))
-        .execute()
-    )
-    existing = {row["meal_type"]: row["recipe_id"] for row in (resp.data or [])}
+    # High-calorie users (athletes, aggressive bulking) bypass the shared
+    # template. Their kcal target is too far above the population average
+    # for a shared template to produce an LP-feasible day. Their generated
+    # day is NOT saved back to daily_menu so it doesn't corrupt the shared
+    # template for normal-calorie clients.
+    is_high_kcal = macro_target.get("kcal", 0) > HIGH_KCAL_THRESHOLD
+
+    rows: list = []
+    if not is_high_kcal:
+        resp = (
+            supabase.table("daily_menu")
+            .select("meal_type, recipe_id, created_at")
+            .eq("date", str(date))
+            .execute()
+        )
+        rows = resp.data or []
+
+        # TTL check: if the template is older than TEMPLATE_TTL_DAYS, discard
+        # it and regenerate so stale recipe combinations don't persist forever.
+        # Fails silently if the column is missing or unparseable — old template
+        # is kept in that case (safe default).
+        if rows:
+            try:
+                oldest = min(
+                    datetime.strptime(r["created_at"][:19], "%Y-%m-%dT%H:%M:%S")
+                    for r in rows if r.get("created_at")
+                )
+                if (datetime.utcnow() - oldest).days > TEMPLATE_TTL_DAYS:
+                    rows = []
+            except Exception:
+                pass
+
+    existing = {row["meal_type"]: row["recipe_id"] for row in rows}
 
     recipe_lookup = {r["id"]: r for _, r in scored_recipes}
 
@@ -511,7 +576,7 @@ def get_or_create_daily_template(
         )
         if not candidate:
             continue
-        sc = score_day(candidate, flex_stats)
+        sc = score_day(candidate, flex_stats, recipe_macros=recipe_macros, macro_target=macro_target)
         if sc > best_day_score:
             best_day_score = sc
             best_day       = candidate
@@ -519,18 +584,21 @@ def get_or_create_daily_template(
     if not best_day:
         return None
 
-    supabase.table("daily_menu").upsert(
-        [
-            {
-                "date":      str(date),
-                "meal_type": info["meal_type"],
-                "recipe_id": info["recipe_id"],
-            }
-            for info in best_day.values()
-        ],
-        on_conflict="date,meal_type",
-        ignore_duplicates=True,
-    ).execute()
+    # Only persist the template for normal-calorie clients. High-kcal users
+    # get a personalised day that must not overwrite the shared template.
+    if not is_high_kcal:
+        supabase.table("daily_menu").upsert(
+            [
+                {
+                    "date":      str(date),
+                    "meal_type": info["meal_type"],
+                    "recipe_id": info["recipe_id"],
+                }
+                for info in best_day.values()
+            ],
+            on_conflict="date,meal_type",
+            ignore_duplicates=True,
+        ).execute()
 
     return best_day
 
