@@ -1,3 +1,4 @@
+import math
 from typing import Dict, Any, List, Tuple
 from collections import defaultdict
 
@@ -42,6 +43,17 @@ WEIGHT_PROTEIN   = 1.0
 WEIGHT_CARBS     = 1.0
 WEIGHT_FAT       = 1.0
 WEIGHT_KCAL_SOFT = 0.30
+
+# Maximum factor by which max_serving may be auto-scaled when the day's
+# recipe combination structurally cannot reach the calorie target at max servings.
+# Prevents LP infeasibility for high-calorie users (athletes, etc.).
+MAX_SERVING_SCALE_FACTOR = 3.0
+
+# When a meal has ≥ 2 subrecipes, no single subrecipe's servings may exceed
+# SERVING_BALANCE_RATIO × any other subrecipe's servings in the same meal.
+# Prevents one ingredient from dominating (e.g. "3 Greek yogurts, ½ granola").
+# Always LP-feasible: min_serving ≥ 1 satisfies 1 ≤ RATIO × 1 trivially.
+SERVING_BALANCE_RATIO = 2.5
 
 
 # =============================================================================
@@ -321,6 +333,27 @@ def _solve_lp_once(
         prob += total_F <= (1.0 + macro_tol) * F_t
 
     # ------------------------------------------------------------------
+    # Intra-meal serving balance constraint
+    # For meals with ≥ 2 subrecipes, no single ingredient may have more
+    # than SERVING_BALANCE_RATIO × any other ingredient's servings.
+    # This prevents one item dominating a meal (e.g. "3 Greek yogurts,
+    # ½ serving granola") while keeping the LP always feasible: both
+    # sides share the same lower bound (≥ 1), so 1 ≤ RATIO × 1 holds.
+    # ------------------------------------------------------------------
+    meal_sub_indices: Dict[str, List[int]] = defaultdict(list)
+    for _idx, _s in enumerate(all_subs):
+        meal_sub_indices[_s["meal"]].append(_idx)
+
+    for _indices in meal_sub_indices.values():
+        if len(_indices) < 2:
+            continue
+        for _a in _indices:
+            for _b in _indices:
+                if _a == _b:
+                    continue
+                prob += servings_expr[_a] <= SERVING_BALANCE_RATIO * servings_expr[_b]
+
+    # ------------------------------------------------------------------
     # Meal-type kcal distribution constraints
     # Caps are relative to total_K (not the fixed kcal_t) so they stay
     # proportionally meaningful when the solver drifts within the band.
@@ -490,6 +523,24 @@ def optimize_subrecipes(
     C_t    = float(macro_target.get("carbs_g")   or 0.0)
     F_t    = float(macro_target.get("fat_g")     or 0.0)
     kcal_t = float(macro_target.get("kcal")      or (4.0 * (P_t + C_t) + 9.0 * F_t))
+
+    # ------------------------------------------------------------------
+    # 2b. Pre-feasibility guard: if maxing every subrecipe at its current
+    #     max_serving still can't reach (1 - widest_tol) × kcal_t, the LP
+    #     will be structurally infeasible at every tolerance level.
+    #     Solution: uniformly scale max_serving up, capped at
+    #     MAX_SERVING_SCALE_FACTOR, so the ceiling is always reachable.
+    # ------------------------------------------------------------------
+    if kcal_t > 0:
+        max_achievable_kcal = sum(s["max_serving"] * s["macros"]["kcal"] for s in all_subs)
+        min_needed_kcal     = (1.0 - KCAL_TOLERANCES[-1]) * kcal_t
+        if max_achievable_kcal < min_needed_kcal:
+            scale = min(
+                (kcal_t / max(max_achievable_kcal, 1.0)) * 1.05,
+                MAX_SERVING_SCALE_FACTOR,
+            )
+            for s in all_subs:
+                s["max_serving"] = math.ceil(s["max_serving"] * scale)
 
     # Guard: if all targets are zero we have nothing to optimise.
     if kcal_t <= 0:
