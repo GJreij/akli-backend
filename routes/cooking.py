@@ -1,5 +1,6 @@
 from flask import Blueprint, request, jsonify
 from services.cooking_service import get_cooking_overview
+from utils.event_logger import log_event
 from datetime import datetime, timedelta
 
 
@@ -43,4 +44,9 @@ def cooking_overview():
     }
 
     result = get_cooking_overview(start_date, end_date, filters)
+    log_event(None, "cooking_overview_viewed", {
+        "start_date": start_date,
+        "end_date": end_date,
+        "filters_applied": {k: v for k, v in filters.items() if v is not None},
+    })
     return jsonify(result)

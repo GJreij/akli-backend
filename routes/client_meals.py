@@ -1,6 +1,7 @@
 from flask import Blueprint, request, jsonify
 from datetime import date, timedelta
 from services.client_meals_service import ClientMealsService
+from utils.event_logger import log_event
 
 client_meals_bp = Blueprint("client_meals", __name__)
 service = ClientMealsService()
@@ -29,4 +30,5 @@ def upcoming_recipes():
         to_date=to_date
     )
 
+    log_event(user_id, "meal_plan_viewed", {"from_date": from_date, "to_date": to_date})
     return jsonify(result), 200

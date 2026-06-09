@@ -2,6 +2,7 @@
 
 from flask import Blueprint, request, jsonify
 from services.weekly_menu_service import WeeklyMenuService
+from utils.event_logger import log_event
 
 get_available_recipes_bp = Blueprint("get_available_recipes", __name__)
 weekly_menu_service = WeeklyMenuService()
@@ -39,9 +40,19 @@ def available_recipes_for_date():
             tenant_id=tenant_id
         )
 
+        if status_code == 200:
+            log_event(None, "available_recipes_fetched", {
+                "date": date_str,
+                "tenant_id": tenant_id,
+                "recipe_count": len(result) if isinstance(result, list) else None,
+            })
+        else:
+            log_event(None, "api_error", {"route": "/available_recipes_for_date", "status_code": status_code, "date": date_str})
+
         return jsonify(result), status_code
 
     except Exception as e:
+        log_event(None, "api_error", {"route": "/available_recipes_for_date", "status_code": 500, "error": str(e)})
         return jsonify({
             "error": "An unexpected error occurred while fetching available recipes.",
             "details": str(e)

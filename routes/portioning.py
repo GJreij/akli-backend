@@ -6,6 +6,7 @@ from services.portioning_service import (
     parse_int_list,
     get_portioning_summary
 )
+from utils.event_logger import log_event
 
 portioning_bp = Blueprint("portioning", __name__)
 
@@ -38,6 +39,11 @@ def portioning_summary():
     )
 
     if error:
+        log_event(None, "api_error", {"route": "/portioning/summary", "status_code": 400, "error": error})
         return jsonify({"error": error}), 400
 
+    log_event(None, "portioning_summary_viewed", {
+        "subrecipe_id": subrecipe_id,
+        "mpdr_count": len(meal_plan_day_recipe_ids) if meal_plan_day_recipe_ids else 0,
+    })
     return jsonify(result)

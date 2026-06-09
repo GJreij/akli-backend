@@ -5,6 +5,7 @@ import random
 
 from utils.supabase_client import supabase
 from services.mealplan_service import optimize_subrecipes
+from utils.event_logger import log_event
 
 mealplan_bp = Blueprint("mealplan", __name__)
 
@@ -567,8 +568,15 @@ def check_meal_plan_conflict():
     )
     conflicts = resp.data or []
 
+    has_conflict = len(conflicts) > 0
+    log_event(user_id, "meal_plan_conflict_checked", {
+        "start_date": str(start_date),
+        "end_date": str(end_date),
+        "has_conflict": has_conflict,
+        "conflict_count": len(conflicts),
+    })
     return jsonify({
-        "has_conflict": len(conflicts) > 0,
+        "has_conflict": has_conflict,
         "conflicts":    conflicts,
         "selected":     {"start_date": str(start_date), "end_date": str(end_date)},
     }), 200
@@ -867,6 +875,13 @@ def generate_meal_plan():
             "meals":       meals_list,
         })
 
+    log_event(user_id, "meal_plan_generated", {
+        "start_date": str(start_date),
+        "end_date": str(end_date),
+        "num_days": len(days),
+        "meals_per_day": len(meals_map),
+        "excluded_dates_count": len(excluded_dates),
+    })
     return jsonify({
         "user_id":            user_id,
         "start_date":         str(start_date),
@@ -888,9 +903,16 @@ def update_meal_plan_endpoint():
     logs          = data.get("change_logs", [])
 
     if not original_plan or not isinstance(logs, list):
+        log_event(None, "api_error", {"route": "/update_meal_plan", "status_code": 400, "reason": "missing_or_invalid_input"})
         return jsonify({"error": "Missing or invalid input data"}), 400
 
     from services.mealplan_update_dynamic_service import update_meal_plan
     updated = update_meal_plan(original_plan, logs)
 
+    user_id = original_plan.get("user_id")
+    log_event(user_id, "recipe_swap_triggered", {
+        "change_count": len(logs),
+        "start_date": original_plan.get("start_date"),
+        "end_date": original_plan.get("end_date"),
+    })
     return jsonify(updated), 200

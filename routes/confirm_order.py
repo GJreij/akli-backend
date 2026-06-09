@@ -2,10 +2,11 @@
 
 from flask import Blueprint, request, jsonify
 from services.order_service import OrderService
+from utils.event_logger import log_event
 import traceback
-import logging  # ← add
+import logging
 
-logger = logging.getLogger(__name__)  # ← add
+logger = logging.getLogger(__name__)
 
 confirm_order_bp = Blueprint("confirm_order", __name__)
 order_service = OrderService()
@@ -44,6 +45,7 @@ def confirm_order():
             missing.append("delivery_slot_id")
 
         if missing:
+            log_event(user_id, "api_error", {"route": "/confirm_order", "status_code": 400, "reason": "missing_fields", "missing_fields": missing})
             return jsonify({
                 "error": "Missing required fields",
                 "missing_fields": missing
@@ -57,10 +59,19 @@ def confirm_order():
             delivery_slot_id=delivery_slot_id,
         )
 
+        if status_code == 200:
+            log_event(user_id, "order_created", {
+                "delivery_slot_id": delivery_slot_id,
+                "order_id": result.get("order_id") or result.get("id"),
+            })
+        else:
+            log_event(user_id, "api_error", {"route": "/confirm_order", "status_code": status_code, "error": result.get("error")})
+
         return jsonify(result), status_code
 
     except Exception as e:
-        logger.error("confirm_order failed: %s\n%s", str(e), traceback.format_exc())  # ← add
+        logger.error("confirm_order failed: %s\n%s", str(e), traceback.format_exc())
+        log_event(None, "api_error", {"route": "/confirm_order", "status_code": 500, "error": str(e)})
         return jsonify({
             "error": "An unexpected error occurred during order confirmation.",
             "details": str(e)

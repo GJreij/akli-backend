@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify
 import statistics
 from utils.supabase_client import supabase
 from services.promo_service import validate_and_apply_promo_code
+from utils.event_logger import log_event
 
 checkout_bp = Blueprint("checkout", __name__)
 
@@ -56,6 +57,7 @@ def checkout_summary():
             raise ValueError("No pricing data found")
         price_data = price_resp.data[0]
     except Exception as e:
+        log_event(user_id, "api_error", {"route": "/checkout_summary", "status_code": 500, "error": str(e)})
         return jsonify({"error": f"Failed to fetch pricing data: {str(e)}"}), 500
 
     protein_price = price_data.get("proteing_g_price", 0) or 0
@@ -222,4 +224,12 @@ def checkout_summary():
         }
     }
 
+    log_event(user_id, "checkout_viewed", {
+        "total_meals": total_meals,
+        "num_days": number_of_days,
+        "total_price": round(total_price, 2),
+        "final_price": final_price_with_delivery,
+        "promo_code_used": promo_code or None,
+        "promo_status": promo_result["status"],
+    })
     return jsonify(summary), 200

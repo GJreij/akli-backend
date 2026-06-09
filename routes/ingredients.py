@@ -1,5 +1,6 @@
 from flask import Blueprint, request, jsonify
 from services.ingredients_service import get_ingredients_to_buy
+from utils.event_logger import log_event
 
 ingredients_bp = Blueprint("ingredients", __name__)
 
@@ -35,7 +36,13 @@ def ingredients_to_buy():
             client=client,
             delivery_slot=delivery_slot,
         )
+        log_event(None, "ingredients_viewed", {
+            "start_date": start_date,
+            "end_date": end_date,
+            "filters_applied": {k: v for k, v in {"recipe": recipe, "client": client, "delivery_slot": delivery_slot}.items() if v},
+        })
         return jsonify(result)
 
     except Exception as e:
+        log_event(None, "api_error", {"route": "/ingredients-to-buy", "status_code": 500, "error": str(e)})
         return jsonify({"error": str(e)}), 500
