@@ -30,13 +30,6 @@ SERVING_MIN_BY_STEP = {
 
 DEFAULT_MAX_SERVING = 3
 
-# Meal-type kcal distribution caps (relative to TOTAL solved kcal, not target).
-BREAKFAST_MAX_PCT        = 0.40
-SNACK_MAX_PCT            = 0.25
-DINNER_LUNCH_DIFF_PCT    = 0.40   # |dinner - lunch| / smaller <= 40%
-NO_DINNER_YES_LUNCH_PCT  = 0.60
-NO_LUNCH_YES_DINNER_PCT  = 0.60
-
 # Objective weights — all expressed as fractions of their macro targets,
 # so a 10 g overshoot on protein is equally bad as 10 g on carbs (percentage-wise).
 WEIGHT_PROTEIN   = 1.0
@@ -49,11 +42,36 @@ WEIGHT_KCAL_SOFT = 0.30
 # Prevents LP infeasibility for high-calorie users (athletes, etc.).
 MAX_SERVING_SCALE_FACTOR = 3.0
 
-# When a meal has ≥ 2 subrecipes, no single subrecipe's servings may exceed
-# SERVING_BALANCE_RATIO × any other subrecipe's servings in the same meal.
-# Prevents one ingredient from dominating (e.g. "3 Greek yogurts, ½ granola").
-# Always LP-feasible: min_serving ≥ 1 satisfies 1 ≤ RATIO × 1 trivially.
-SERVING_BALANCE_RATIO = 2.5
+# =============================================================================
+# CULINARY CONSTRAINT SETS
+# The solver runs two passes before falling back to the greedy heuristic:
+#   Pass 1 — STRICT:   tighter culinary guardrails, better plate aesthetics.
+#   Pass 2 — RELAXED:  looser guardrails, macro accuracy takes full priority.
+# All macro hard-bands (kcal ± tol, protein/carbs/fat ± macro_tol) are
+# IDENTICAL in both passes — only the culinary layer changes.
+# Tune these values freely after testing; they have no effect on macro maths.
+# =============================================================================
+
+# ── STRICT culinary constraints (Pass 1) ─────────────────────────────────────
+# Meal-type kcal distribution caps (relative to TOTAL solved kcal, not target).
+STRICT_BREAKFAST_MAX_PCT       = 0.40
+STRICT_SNACK_MAX_PCT           = 0.25
+STRICT_DINNER_LUNCH_DIFF_PCT   = 0.40   # |dinner - lunch| / smaller <= 40 %
+STRICT_NO_DINNER_YES_LUNCH_PCT = 0.60
+STRICT_NO_LUNCH_YES_DINNER_PCT = 0.60
+# Intra-meal balance: no subrecipe may exceed RATIO × any other subrecipe in
+# the same meal.  Prevents "3 Greek yogurts / ½ granola" style domination.
+STRICT_SERVING_BALANCE_RATIO   = 2.5
+
+# ── RELAXED culinary constraints (Pass 2) ────────────────────────────────────
+# Slightly wider caps so the LP has more room when strict constraints cause
+# infeasibility.  Solo-meal % caps (NO_DINNER / NO_LUNCH variants) are dropped
+# entirely in this pass — without the paired meal there is no real distribution
+# problem worth enforcing.
+RELAXED_BREAKFAST_MAX_PCT      = 0.50
+RELAXED_SNACK_MAX_PCT          = 0.35
+RELAXED_DINNER_LUNCH_DIFF_PCT  = 0.60   # |dinner - lunch| / smaller <= 60 %
+RELAXED_SERVING_BALANCE_RATIO  = 4.0
 
 
 # =============================================================================
@@ -216,6 +234,7 @@ def _solve_lp_once(
     tol: float,
     macro_tol: float,
     allow_under_kcal: bool,
+    strict_culinary: bool = True,
 ) -> Tuple[List[Dict], float, Dict] | None:
     """
     Build and solve one LP instance.
@@ -234,10 +253,37 @@ def _solve_lp_once(
 
     4. Meal-type distribution caps are relative to total_K (not fixed kcal_t).
 
+    5. strict_culinary=True  → STRICT culinary constraint set (Pass 1).
+       strict_culinary=False → RELAXED culinary constraint set (Pass 2).
+       Macro hard-bands are identical in both passes.
+
     Returns None if the LP is infeasible or non-optimal.
     """
     serving_min = SERVING_MIN_BY_STEP.get(serving_step, 1.0)
-    label = f"MealPlan_tol{int(tol * 100)}_step{serving_step}"
+    culinary_tag = "strict" if strict_culinary else "relaxed"
+    label = f"MealPlan_tol{int(tol * 100)}_step{serving_step}_{culinary_tag}"
+
+    # ------------------------------------------------------------------
+    # Resolve culinary constraint values from the active constraint set.
+    # All variables below map 1-to-1 to a CONFIG constant so you can
+    # tune them at the top of the file without touching this logic.
+    # ------------------------------------------------------------------
+    if strict_culinary:
+        _breakfast_max    = STRICT_BREAKFAST_MAX_PCT
+        _snack_max        = STRICT_SNACK_MAX_PCT
+        _dl_diff          = STRICT_DINNER_LUNCH_DIFF_PCT
+        _no_dinner_lunch  = STRICT_NO_DINNER_YES_LUNCH_PCT
+        _no_lunch_dinner  = STRICT_NO_LUNCH_YES_DINNER_PCT
+        _balance_ratio    = STRICT_SERVING_BALANCE_RATIO
+        _apply_solo_caps  = True   # solo-meal % caps active in strict mode
+    else:
+        _breakfast_max    = RELAXED_BREAKFAST_MAX_PCT
+        _snack_max        = RELAXED_SNACK_MAX_PCT
+        _dl_diff          = RELAXED_DINNER_LUNCH_DIFF_PCT
+        _no_dinner_lunch  = None   # dropped in relaxed mode
+        _no_lunch_dinner  = None   # dropped in relaxed mode
+        _balance_ratio    = RELAXED_SERVING_BALANCE_RATIO
+        _apply_solo_caps  = False
 
     prob = LpProblem(label, LpMinimize)
 
@@ -351,7 +397,7 @@ def _solve_lp_once(
             for _b in _indices:
                 if _a == _b:
                     continue
-                prob += servings_expr[_a] <= SERVING_BALANCE_RATIO * servings_expr[_b]
+                prob += servings_expr[_a] <= _balance_ratio * servings_expr[_b]
 
     # ------------------------------------------------------------------
     # Meal-type kcal distribution constraints
@@ -374,42 +420,44 @@ def _solve_lp_once(
     has_snack     = "snack"     in types
 
     if has_breakfast and has_lunch and has_dinner and has_snack:
-        prob += kcal_by_type["snack"]     <= SNACK_MAX_PCT     * total_K
-        prob += kcal_by_type["breakfast"] <= BREAKFAST_MAX_PCT * total_K
-        prob += kcal_by_type["dinner"] - kcal_by_type["lunch"] <= DINNER_LUNCH_DIFF_PCT * kcal_by_type["lunch"]
-        prob += kcal_by_type["lunch"] - kcal_by_type["dinner"] <= DINNER_LUNCH_DIFF_PCT * kcal_by_type["dinner"]
+        prob += kcal_by_type["snack"]     <= _snack_max     * total_K
+        prob += kcal_by_type["breakfast"] <= _breakfast_max * total_K
+        prob += kcal_by_type["dinner"] - kcal_by_type["lunch"] <= _dl_diff * kcal_by_type["lunch"]
+        prob += kcal_by_type["lunch"] - kcal_by_type["dinner"] <= _dl_diff * kcal_by_type["dinner"]
 
     elif has_snack and has_lunch and has_dinner and not has_breakfast:
-        prob += kcal_by_type["snack"] <= SNACK_MAX_PCT * total_K
-        prob += kcal_by_type["dinner"] - kcal_by_type["lunch"] <= DINNER_LUNCH_DIFF_PCT * kcal_by_type["lunch"]
-        prob += kcal_by_type["lunch"] - kcal_by_type["dinner"] <= DINNER_LUNCH_DIFF_PCT * kcal_by_type["dinner"]
+        prob += kcal_by_type["snack"] <= _snack_max * total_K
+        prob += kcal_by_type["dinner"] - kcal_by_type["lunch"] <= _dl_diff * kcal_by_type["lunch"]
+        prob += kcal_by_type["lunch"] - kcal_by_type["dinner"] <= _dl_diff * kcal_by_type["dinner"]
 
     elif has_lunch and has_dinner and not has_snack and not has_breakfast:
-        prob += kcal_by_type["dinner"] - kcal_by_type["lunch"] <= DINNER_LUNCH_DIFF_PCT * kcal_by_type["lunch"]
-        prob += kcal_by_type["lunch"] - kcal_by_type["dinner"] <= DINNER_LUNCH_DIFF_PCT * kcal_by_type["dinner"]
+        prob += kcal_by_type["dinner"] - kcal_by_type["lunch"] <= _dl_diff * kcal_by_type["lunch"]
+        prob += kcal_by_type["lunch"] - kcal_by_type["dinner"] <= _dl_diff * kcal_by_type["dinner"]
 
     elif has_breakfast and has_lunch and has_snack and not has_dinner:
-        prob += kcal_by_type["snack"]     <= SNACK_MAX_PCT     * total_K
-        prob += kcal_by_type["breakfast"] <= BREAKFAST_MAX_PCT * total_K
-        prob += kcal_by_type["lunch"]     <= NO_DINNER_YES_LUNCH_PCT * total_K
+        prob += kcal_by_type["snack"]     <= _snack_max     * total_K
+        prob += kcal_by_type["breakfast"] <= _breakfast_max * total_K
+        if _apply_solo_caps:
+            prob += kcal_by_type["lunch"] <= _no_dinner_lunch * total_K
 
     elif has_breakfast and has_dinner and has_snack and not has_lunch:
-        prob += kcal_by_type["snack"]     <= SNACK_MAX_PCT     * total_K
-        prob += kcal_by_type["breakfast"] <= BREAKFAST_MAX_PCT * total_K
-        prob += kcal_by_type["dinner"]    <= NO_LUNCH_YES_DINNER_PCT * total_K
+        prob += kcal_by_type["snack"]     <= _snack_max     * total_K
+        prob += kcal_by_type["breakfast"] <= _breakfast_max * total_K
+        if _apply_solo_caps:
+            prob += kcal_by_type["dinner"] <= _no_lunch_dinner * total_K
 
     elif has_snack and has_dinner and not has_lunch and not has_breakfast:
-        prob += kcal_by_type["snack"] <= SNACK_MAX_PCT * total_K
+        prob += kcal_by_type["snack"] <= _snack_max * total_K
 
     elif has_snack and has_lunch and not has_dinner and not has_breakfast:
-        prob += kcal_by_type["snack"] <= SNACK_MAX_PCT * total_K
+        prob += kcal_by_type["snack"] <= _snack_max * total_K
 
     elif has_breakfast and has_snack and not has_lunch and not has_dinner:
-        prob += kcal_by_type["snack"]     <= SNACK_MAX_PCT     * total_K
-        prob += kcal_by_type["breakfast"] <= BREAKFAST_MAX_PCT * total_K
+        prob += kcal_by_type["snack"]     <= _snack_max     * total_K
+        prob += kcal_by_type["breakfast"] <= _breakfast_max * total_K
 
     elif has_breakfast and not has_snack and not has_lunch and not has_dinner:
-        prob += kcal_by_type["breakfast"] <= BREAKFAST_MAX_PCT * total_K
+        prob += kcal_by_type["breakfast"] <= _breakfast_max * total_K
 
     # All other single-meal or unrecognised combinations: no distribution constraint.
 
@@ -441,6 +489,7 @@ def _solve_lp_once(
         "kcal":              int(round(value(total_K))),
         "tolerance_used":    tol,
         "serving_step_used": serving_step,
+        "culinary_pass":     "strict" if strict_culinary else "relaxed",
     }
 
     optimized = []
@@ -549,24 +598,37 @@ def optimize_subrecipes(
         )
 
     # ------------------------------------------------------------------
-    # 3. Tolerance ladder: paired kcal + macro tolerances, integer then half-step.
+    # 3. Two-pass tolerance ladder.
+    #
+    #    Pass 1 — STRICT culinary constraints:
+    #      Tighter balance ratios and meal-type caps.  Best plate aesthetics.
+    #
+    #    Pass 2 — RELAXED culinary constraints:
+    #      Wider balance ratios, looser meal caps, solo-meal caps dropped.
+    #      Reached only when every strict attempt fails.
+    #      Macro hard-bands (kcal ± tol, protein/carbs/fat ± macro_tol) are
+    #      IDENTICAL in both passes — nutritional accuracy is never traded.
+    #
+    #    Pass 3 — greedy fallback (last resort).
     # ------------------------------------------------------------------
-    for tol, macro_tol in zip(KCAL_TOLERANCES, MACRO_TOLERANCES):
-        for step in (1.0, SERVING_STEP_FINE):
-            result = _solve_lp_once(
-                all_subs=all_subs,
-                recipes_by_meal=recipes_by_meal,
-                P_t=P_t,
-                C_t=C_t,
-                F_t=F_t,
-                kcal_t=kcal_t,
-                serving_step=step,
-                tol=tol,
-                macro_tol=macro_tol,
-                allow_under_kcal=allow_under_kcal,
-            )
-            if result is not None:
-                return result
+    for strict_culinary in (True, False):
+        for tol, macro_tol in zip(KCAL_TOLERANCES, MACRO_TOLERANCES):
+            for step in (1.0, SERVING_STEP_FINE):
+                result = _solve_lp_once(
+                    all_subs=all_subs,
+                    recipes_by_meal=recipes_by_meal,
+                    P_t=P_t,
+                    C_t=C_t,
+                    F_t=F_t,
+                    kcal_t=kcal_t,
+                    serving_step=step,
+                    tol=tol,
+                    macro_tol=macro_tol,
+                    allow_under_kcal=allow_under_kcal,
+                    strict_culinary=strict_culinary,
+                )
+                if result is not None:
+                    return result
 
     # ------------------------------------------------------------------
     # 4. All LP attempts failed — use greedy safe fallback.
