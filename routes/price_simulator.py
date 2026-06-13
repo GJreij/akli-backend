@@ -1,43 +1,7 @@
 from flask import Blueprint, request, jsonify
-from utils.supabase_client import supabase
+from services.pricing_service import get_kcal_discount, fetch_latest_prices
 
 simple_price_bp = Blueprint("simple_price_simulator", __name__)
-
-# Same logic as your original
-def get_kcal_discount(kcal: float) -> float:
-    min_kcal = 1200
-    max_kcal = 3000
-    max_discount = 0.15
-
-    if kcal <= min_kcal:
-        return 0.0
-    if kcal >= max_kcal:
-        return max_discount
-
-    ratio = (kcal - min_kcal) / (max_kcal - min_kcal)
-    return ratio * max_discount
-
-
-def fetch_latest_prices():
-    price_resp = (
-        supabase.table("macro_price")
-        .select("*")
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    if not price_resp.data:
-        raise ValueError("No pricing data found in macro_price")
-
-    price_data = price_resp.data[0] or {}
-    return {
-        "protein_price": float(price_data.get("proteing_g_price", 0) or 0),
-        "carbs_price": float(price_data.get("carbs_g_price", 0) or 0),
-        "fat_price": float(price_data.get("fat_g_price", 0) or 0),
-        "day_packaging_price": float(price_data.get("day_packaging_price", 0) or 0),
-        "recipe_packaging_price": float(price_data.get("recipe_packaging_price", 0) or 0),
-        "subrecipe_packaging_price": float(price_data.get("subrecipe_packaging_price", 0) or 0),
-    }
 
 
 @simple_price_bp.route("/simple_price_simulator", methods=["POST"])
@@ -94,9 +58,9 @@ def simple_price_simulator():
 
     # Macro cost (per day)
     base_macro_cost = (
-        protein_g * prices["protein_price"]
-        + carbs_g * prices["carbs_price"]
-        + fat_g * prices["fat_price"]
+        protein_g * prices["protein_price_per_g"]
+        + carbs_g * prices["carbs_price_per_g"]
+        + fat_g * prices["fat_price_per_g"]
     )
 
     discount_pct = get_kcal_discount(estimated_kcal) if apply_kcal_discount else 0.0
@@ -125,9 +89,9 @@ def simple_price_simulator():
         "avg_day_price": avg_day_price,
         "breakdown": {
             "prices_used": {
-                "protein_price_per_g": prices["protein_price"],
-                "carbs_price_per_g": prices["carbs_price"],
-                "fat_price_per_g": prices["fat_price"],
+                "protein_price_per_g": prices["protein_price_per_g"],
+                "carbs_price_per_g": prices["carbs_price_per_g"],
+                "fat_price_per_g": prices["fat_price_per_g"],
                 "day_packaging_price": prices["day_packaging_price"],
                 "recipe_packaging_price": prices["recipe_packaging_price"],
                 "subrecipe_packaging_price": prices["subrecipe_packaging_price"]
