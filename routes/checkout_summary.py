@@ -7,7 +7,7 @@ from utils.event_logger import log_event
 checkout_bp = Blueprint("checkout", __name__)
 
 # -------------------------------
-# CONFIGuration
+# CONFIG
 # -------------------------------
 DELIVERY_DAY_MINIMUM = 25  # if a given day's total < 25, delivery applies for that day
 
