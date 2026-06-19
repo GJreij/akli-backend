@@ -728,8 +728,8 @@ def generate_meal_plan():
         meals_map = {
             "breakfast": "breakfast",
             "lunch":     "lunch",
-            "dinner":    "dinner",
             "snack":     "snack",
+            "dinner":    "dinner",
         }
 
     # ------------------------------------------------------------------
