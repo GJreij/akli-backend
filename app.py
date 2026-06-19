@@ -28,7 +28,7 @@ app.register_blueprint(cooking_bp)
 app.register_blueprint(portioning_bp)
 app.register_blueprint(packaging_bp)
 app.register_blueprint(client_meals_bp)
-app.register_blueprint(simple_price_bp)  # <--- FIX
+app.register_blueprint(simple_price_bp)  # <--- FIX this
 app.register_blueprint(get_available_recipes_bp)
 
 @app.route("/")
