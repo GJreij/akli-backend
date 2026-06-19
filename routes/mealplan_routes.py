@@ -662,6 +662,7 @@ def generate_meal_plan():
     end_date_str     = data.get("end_date")
     include_weekends = data.get("include_weekends", False)
     raw_meals        = data.get("meals")
+    kcal_override    = data.get("kcal_override")   # optional: client-computed reduced target
     kitchen_id       = data.get("kitchen_id")
 
     if not user_id:
@@ -824,7 +825,10 @@ def generate_meal_plan():
     protein_g = float(t.get("protein_g")   or 0)
     carbs_g   = float(t.get("carbs_g")     or 0)
     fat_g     = float(t.get("fat_g")       or 0)
-    kcal_t    = float(t.get("kcal_target") or (4 * (protein_g + carbs_g) + 9 * fat_g))
+    kcal_db   = float(t.get("kcal_target") or (4 * (protein_g + carbs_g) + 9 * fat_g))
+    # kcal_override lets the client reduce the daily target when the user is
+    # "eating out" for excluded meal types (those calories are not Akli's).
+    kcal_t = float(kcal_override) if kcal_override and float(kcal_override) > 0 else kcal_db
     target_with_kcal = {
         "protein_g": protein_g,
         "carbs_g":   carbs_g,
