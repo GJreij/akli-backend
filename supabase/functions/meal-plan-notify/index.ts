@@ -67,7 +67,7 @@ serve(async (req) => {
   let deliveryAddress: string | null = null;
   const { data: days } = await supabase
     .from("meal_plan_day")
-    .select("delivery_id")
+    .select("id, delivery_id")
     .eq("meal_plan_id", record?.id);
 
   const deliveryIds = (days ?? [])
@@ -97,6 +97,20 @@ serve(async (req) => {
     deliveryAddress = defaultAddr?.address_text ?? null;
   }
 
+  // 3c) Resolve the payment method used for this order, so the admin can
+  // reach out to the client about it if needed.
+  let paymentProvider: string | null = null;
+  const mealPlanDayIds = (days ?? []).map((d: { delivery_id: number | null; id?: number }) => d.id);
+  if (mealPlanDayIds.length > 0) {
+    const { data: paymentRows } = await supabase
+      .from("payment")
+      .select("provider")
+      .in("meal_plan_day_id", mealPlanDayIds)
+      .not("provider", "is", null)
+      .limit(1);
+    paymentProvider = paymentRows?.[0]?.provider ?? null;
+  }
+
   // 4) Build and send email
   const subject = `🥗 New Akli Order — ${fullName}`;
   const html = `
@@ -112,6 +126,11 @@ serve(async (req) => {
     <h3>📦 Delivery</h3>
     <ul>
       <li><b>Address:</b> ${deliveryAddress ?? "—"}</li>
+    </ul>
+
+    <h3>💳 Payment</h3>
+    <ul>
+      <li><b>Method:</b> ${paymentProvider ?? "—"}</li>
     </ul>
 
     <h3>📋 Plan Details</h3>
