@@ -56,7 +56,9 @@ async function sendEmail(subject: string, html: string) {
 
 // Pull the diet/goal info the client submitted during onboarding — lives on
 // daily_macro_target now (goal, sex, height_cm, weight_kg, activity_level,
-// method, diet_type, kcal_target), not on the user row itself.
+// method, diet_type, kcal_target), not on the user row itself. Only used by
+// the onboarding-completed (user UPDATE) path below, since by then the macro
+// row is guaranteed to already exist.
 async function fetchLatestDiet(userId: string) {
   const { data } = await supabase
     .from("daily_macro_target")
@@ -64,6 +66,15 @@ async function fetchLatestDiet(userId: string) {
     .eq("user_id", userId)
     .order("created_at", { ascending: false })
     .limit(1)
+    .single();
+  return data;
+}
+
+async function fetchUser(userId: string) {
+  const { data } = await supabase
+    .from("user")
+    .select("name, last_name, email, phone_number, created_at")
+    .eq("id", userId)
     .single();
   return data;
 }
@@ -123,28 +134,37 @@ serve(async (req) => {
   const schema = payload?.schema;
   const table = payload?.table;
 
-  if (schema !== "public" || table !== "user") {
+  if (schema !== "public") {
     return new Response("ignored", { status: 200 });
   }
 
   const record = payload?.record;
   const oldRecord = payload?.old_record;
 
-  // 1) New user inserted — this fires the moment someone finishes onboarding
-  // and creates their account, so include what they just told us.
-  if (type === "INSERT") {
-    const diet = await fetchLatestDiet(record?.id);
+  // 1) New diet target inserted — fires right after onboarding finishes
+  // (the macro row is written right after the user row, in the same
+  // create-profile request), so by the time this trigger fires both the
+  // account and the diet inputs are guaranteed to exist. The payload here
+  // *is* the diet row, so no extra lookup/race is needed for that part.
+  if (table === "daily_macro_target" && type === "INSERT") {
+    // Skip notifications for later diet updates — only the very first one,
+    // right after signup, should trigger this "new client" email.
+    if (record?.source !== "onboarding") {
+      return new Response("ignored", { status: 200 });
+    }
 
-    const subject = `New user signup: ${record?.email ?? record?.id ?? ""}`;
+    const user = await fetchUser(record?.user_id);
+
+    const subject = `New user signup: ${user?.email ?? record?.user_id ?? ""}`;
     const html = `
       <h3>New user signed up</h3>
       <ul>
-        <li><b>Name:</b> ${record?.name ?? ""} ${record?.last_name ?? ""}</li>
-        <li><b>Email:</b> ${record?.email ?? ""}</li>
-        <li><b>Phone:</b> ${record?.phone_number ?? ""}</li>
-        <li><b>Created at:</b> ${record?.created_at ?? ""}</li>
+        <li><b>Name:</b> ${user?.name ?? ""} ${user?.last_name ?? ""}</li>
+        <li><b>Email:</b> ${user?.email ?? ""}</li>
+        <li><b>Phone:</b> ${user?.phone_number ?? ""}</li>
+        <li><b>Created at:</b> ${user?.created_at ?? ""}</li>
       </ul>
-      ${dietSectionHtml(diet)}
+      ${dietSectionHtml(record)}
     `;
     console.log("About to send email, subject:", subject);
 
@@ -152,8 +172,9 @@ serve(async (req) => {
     return new Response("ok", { status: 200 });
   }
 
-  // 2) onboarding changed to true (false/null -> true)
-  if (type === "UPDATE") {
+  // 2) onboarding changed to true (false/null -> true) — set manually by the
+  // team later, so the diet row is always settled by this point.
+  if (table === "user" && type === "UPDATE") {
     const newOnboarding = record?.onboarding === true;
     const oldOnboarding = oldRecord?.onboarding === true;
 
