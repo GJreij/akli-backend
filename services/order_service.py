@@ -12,7 +12,7 @@ class OrderService:
 
     # ---------- PUBLIC ORCHESTRATOR ----------
 
-    def confirm_order(self, user_id, meal_plan, checkout_summary, delivery_slot_id, payment_method=None):
+    def confirm_order(self, user_id, meal_plan, checkout_summary, delivery_slot_id, payment_method=None, delivery_address=None, delivery_address_id=None):
         """
         Flow:
           1) Extract ordered meal days from meal_plan
@@ -20,7 +20,7 @@ class OrderService:
           3) Map meal days -> delivery days based on AM/PM logic
           4) Capacity checks & ensure delivery_slots_daily rows (bulk)
           5) Upsert user_delivery_preference
-          6) Fetch user delivery address + partner via partner_client_link
+          6) Resolve delivery address (required) + partner via partner_client_link
           7) Create deliveries and increment slot counts (for delivery days)
           8) Create meal_plan + meal_plan_day (+ link correct deliveries)
           9) Create payment rows linked to meal_plan_day
@@ -66,20 +66,19 @@ class OrderService:
         # 5) upsert preference
         self._upsert_user_delivery_preference(user_id, delivery_slot_id)
 
-        # 6) user info + partner
-        user_info = self._fetch_user_delivery_and_partner(user_id)
-        if not user_info or not user_info.get("delivery_address"):
-            return {"error": "User delivery address not found."}, 400
+        # 6) resolve delivery address (required) + partner
+        resolved_address = self._resolve_delivery_address(user_id, delivery_address_id, delivery_address)
+        if not resolved_address:
+            return {"error": "A delivery address is required to confirm this order."}, 400
 
-        delivery_address = user_info["delivery_address"]
-        partner_id = user_info.get("partner_id")
+        partner_id = self._fetch_partner_id(user_id)
 
         # 7) create deliveries + increment counts (uses DELIVERY days)
         deliveries_map = self._create_deliveries_and_increment_counts(
             user_id=user_id,
             delivery_days=delivery_days,
             delivery_slot_id=delivery_slot_id,
-            delivery_address=delivery_address,
+            delivery_address=resolved_address,
             slot_day_map=slot_day_map,
         )
 
@@ -234,22 +233,45 @@ class OrderService:
                 }
             ).execute()
 
-    def _fetch_user_delivery_and_partner(self, user_id):
+    def _resolve_delivery_address(self, user_id, delivery_address_id=None, delivery_address_text=None):
         """
-        delivery_address from user.
-        partner via partner_client_link (latest/active row if multiple).
+        Resolve the delivery address text to stamp onto deliveries rows.
+        Priority:
+          1) explicit delivery_address_id -> user_delivery_address row (must belong to user)
+          2) explicit delivery_address_text override from frontend
+          3) user's saved default address in user_delivery_address
+        Returns the address text, or None if nothing could be resolved.
         """
-        user_res = (
-            self.sb.table("user")
-            .select("delivery_address")
-            .eq("id", user_id)
+        if delivery_address_id:
+            res = (
+                self.sb.table("user_delivery_address")
+                .select("address_text")
+                .eq("id", delivery_address_id)
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+            if res.data:
+                return res.data[0]["address_text"]
+
+        if delivery_address_text:
+            return delivery_address_text
+
+        default_res = (
+            self.sb.table("user_delivery_address")
+            .select("address_text")
+            .eq("user_id", user_id)
+            .eq("is_default", True)
+            .limit(1)
             .execute()
         )
-        if not user_res.data:
-            return None
+        if default_res.data:
+            return default_res.data[0]["address_text"]
 
-        delivery_address = user_res.data[0].get("delivery_address")
+        return None
 
+    def _fetch_partner_id(self, user_id):
+        """partner via partner_client_link (latest/active row if multiple)."""
         partner_res = (
             self.sb.table("partner_client_link")
             .select("partner_id, start_date")
@@ -258,12 +280,7 @@ class OrderService:
             .limit(1)
             .execute()
         )
-        partner_id = partner_res.data[0]["partner_id"] if partner_res.data else None
-
-        return {
-            "delivery_address": delivery_address,
-            "partner_id": partner_id,
-        }
+        return partner_res.data[0]["partner_id"] if partner_res.data else None
 
     def _create_deliveries_and_increment_counts(
         self,

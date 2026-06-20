@@ -32,7 +32,9 @@ def confirm_order():
         meal_plan = payload.get("meal_plan")
         checkout_summary = payload.get("checkout_summary")
         delivery_slot_id = payload.get("delivery_slot_id")
-        payment_method = payload.get("payment_method")  # "cash" | "whish" | "neo"
+        payment_method      = payload.get("payment_method")       # "cash" | "whish" | "neo"
+        delivery_address    = payload.get("delivery_address")     # free-text override from frontend
+        delivery_address_id = payload.get("delivery_address_id")  # id from user_delivery_address
 
         # ---- Input validation ----
         missing = []
@@ -44,6 +46,8 @@ def confirm_order():
             missing.append("checkout_summary")
         if not delivery_slot_id:
             missing.append("delivery_slot_id")
+        if not delivery_address_id and not delivery_address:
+            missing.append("delivery_address_id")
 
         if missing:
             log_event(user_id, "api_error", {"route": "/confirm_order", "status_code": 400, "reason": "missing_fields", "missing_fields": missing})
@@ -59,6 +63,8 @@ def confirm_order():
             checkout_summary=checkout_summary,
             delivery_slot_id=delivery_slot_id,
             payment_method=payment_method,
+            delivery_address=delivery_address,
+            delivery_address_id=delivery_address_id,
         )
 
         if status_code == 200:
