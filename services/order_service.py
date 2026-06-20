@@ -12,7 +12,7 @@ class OrderService:
 
     # ---------- PUBLIC ORCHESTRATOR ----------
 
-    def confirm_order(self, user_id, meal_plan, checkout_summary, delivery_slot_id):
+    def confirm_order(self, user_id, meal_plan, checkout_summary, delivery_slot_id, payment_method=None):
         """
         Flow:
           1) Extract ordered meal days from meal_plan
@@ -91,12 +91,13 @@ class OrderService:
             meal_to_delivery=meal_to_delivery,  # meal_date -> delivery_date
         )
 
-        # 9) payment (unchanged: uses meal days)
+        # 9) payment
         self._create_payment_record(
             ordered_user_id=user_id,
             partner_id=partner_id,
             checkout_summary=checkout_summary,
             day_to_meal_plan_day_id=day_to_meal_plan_day_id,
+            payment_method=payment_method,
         )
         # Save promo_code_usage if promo was valid
         price_info = checkout_summary.get("price_breakdown", {})
@@ -489,6 +490,7 @@ class OrderService:
         partner_id,
         checkout_summary,
         day_to_meal_plan_day_id,
+        payment_method=None,
     ):
         """
         Create one payment per meal day, linked to meal_plan_day.
@@ -522,7 +524,7 @@ class OrderService:
                         "partner_at_order": partner_id,
                         "amount": amount,
                         "status": "pending",
-                        "provider": None,
+                        "provider": payment_method,
                         "provider_payment_id": None,
                         "currency": "USD",
                         "meal_plan_day_id": meal_plan_day_id,

@@ -32,6 +32,7 @@ def confirm_order():
         meal_plan = payload.get("meal_plan")
         checkout_summary = payload.get("checkout_summary")
         delivery_slot_id = payload.get("delivery_slot_id")
+        payment_method = payload.get("payment_method")  # "cash" | "whish" | "neo"
 
         # ---- Input validation ----
         missing = []
@@ -57,6 +58,7 @@ def confirm_order():
             meal_plan=meal_plan,
             checkout_summary=checkout_summary,
             delivery_slot_id=delivery_slot_id,
+            payment_method=payment_method,
         )
 
         if status_code == 200:
