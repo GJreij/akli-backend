@@ -110,7 +110,7 @@ class OrderService:
             }).execute()
 
 
-        return {"message": "Order successfully confirmed."}, 200
+        return {"success": True, "message": "Order successfully confirmed."}, 200
 
     # ---------- SLOT PERIOD HELPER ----------
 
