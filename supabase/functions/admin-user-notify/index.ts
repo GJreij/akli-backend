@@ -30,13 +30,6 @@ const ACTIVITY_LABELS: Record<string, string> = {
   "1.725": "Very active",
 };
 
-function pickTrueFlag(record: any) {
-  if (record?.self_built_diet) return "self_built_diet";
-  if (record?.non_akli_partner) return "non_akli_partner";
-  if (record?.akli_partner) return "akli_partner";
-  return "none";
-}
-
 async function sendEmail(subject: string, html: string) {
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -165,7 +158,6 @@ serve(async (req) => {
     const oldOnboarding = oldRecord?.onboarding === true;
 
     if (newOnboarding && !oldOnboarding) {
-      const mode = pickTrueFlag(record);
       const diet = await fetchLatestDiet(record?.id);
 
       const subject =
@@ -177,7 +169,6 @@ serve(async (req) => {
           <li><b>Name:</b> ${record?.name ?? ""} ${record?.last_name ?? ""}</li>
           <li><b>Phone:</b> ${record?.phone_number ?? ""}</li>
           <li><b>Email:</b> ${record?.email ?? ""}</li>
-          <li><b>Mode:</b> ${mode}</li>
         </ul>
         ${dietSectionHtml(diet)}
       `;
