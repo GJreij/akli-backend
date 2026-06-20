@@ -49,7 +49,7 @@ serve(async (req) => {
   // 3) Fetch user details from the user table
   const { data: user, error } = await supabase
     .from("user")
-    .select("name, last_name, email, phone_number, delivery_address")
+    .select("name, last_name, email, phone_number")
     .eq("id", record?.user_id)
     .single();
 
@@ -60,6 +60,42 @@ serve(async (req) => {
   const fullName = user
     ? `${user.name ?? ""} ${user.last_name ?? ""}`.trim()
     : "Unknown";
+
+  // 3b) Resolve the actual delivery address used for this order — the user
+  // table no longer carries a single delivery_address column; addresses now
+  // live in user_delivery_address and get stamped per-order onto deliveries.
+  let deliveryAddress: string | null = null;
+  const { data: days } = await supabase
+    .from("meal_plan_day")
+    .select("delivery_id")
+    .eq("meal_plan_id", record?.id);
+
+  const deliveryIds = (days ?? [])
+    .map((d: { delivery_id: number | null }) => d.delivery_id)
+    .filter((id: number | null): id is number => id !== null);
+
+  if (deliveryIds.length > 0) {
+    const { data: deliveryRows } = await supabase
+      .from("deliveries")
+      .select("delivery_address")
+      .in("id", deliveryIds)
+      .not("delivery_address", "is", null)
+      .limit(1);
+    deliveryAddress = deliveryRows?.[0]?.delivery_address ?? null;
+  }
+
+  // Fallback in case this webhook fires before meal_plan_day/deliveries are
+  // written yet — use the user's default saved address instead.
+  if (!deliveryAddress) {
+    const { data: defaultAddr } = await supabase
+      .from("user_delivery_address")
+      .select("address_text")
+      .eq("user_id", record?.user_id)
+      .eq("is_default", true)
+      .limit(1)
+      .single();
+    deliveryAddress = defaultAddr?.address_text ?? null;
+  }
 
   // 4) Build and send email
   const subject = `🥗 New Akli Order — ${fullName}`;
@@ -75,7 +111,7 @@ serve(async (req) => {
 
     <h3>📦 Delivery</h3>
     <ul>
-      <li><b>Address:</b> ${user?.delivery_address ?? "—"}</li>
+      <li><b>Address:</b> ${deliveryAddress ?? "—"}</li>
     </ul>
 
     <h3>📋 Plan Details</h3>
