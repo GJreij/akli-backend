@@ -833,10 +833,13 @@ def generate_meal_plan():
     # kcal_override lets the client reduce the daily target when the user is
     # "eating out" for excluded meal types (those calories are not Akli's).
     kcal_t = float(kcal_override) if kcal_override and float(kcal_override) > 0 else kcal_db
+    # Scale macros proportionally so they stay relatable to the new kcal target
+    # instead of solving toward stale grams sized for the original kcal target.
+    macro_scale = (kcal_t / kcal_db) if kcal_db > 0 else 1.0
     target_with_kcal = {
-        "protein_g": protein_g,
-        "carbs_g":   carbs_g,
-        "fat_g":     fat_g,
+        "protein_g": protein_g * macro_scale,
+        "carbs_g":   carbs_g * macro_scale,
+        "fat_g":     fat_g * macro_scale,
         "kcal":      kcal_t,
     }
 
