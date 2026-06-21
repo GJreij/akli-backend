@@ -4,7 +4,11 @@ from collections import defaultdict
 import copy
 
 from utils.supabase_client import supabase
-from services.mealplan_service import optimize_subrecipes
+from services.mealplan_service import (
+    optimize_subrecipes,
+    apply_weekly_carryover,
+    update_cumulative_deviation,
+)
 
 
 # ------------------------------------------------------------------
@@ -179,6 +183,13 @@ def apply_changes_and_optimize(
     global_daily_target: Dict[str, Any] = updated_plan.get("daily_macro_target", {}) or {}
     new_days: List[Dict[str, Any]] = []
 
+    # Weekly carry-over: accrue (actual - target) across days IN ORDER as we
+    # walk the week, so a re-optimized day's target reflects what happened
+    # on every earlier day this week (changed or not).
+    cumulative_deviation: Dict[str, float] = {
+        "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0, "kcal": 0.0,
+    }
+
     for day in updated_plan.get("days", []):
         date = day["date"]
         day_change = changes.get(date)
@@ -189,7 +200,15 @@ def apply_changes_and_optimize(
         # ✅ NEW: If this day has no change logs, keep it intact (no re-optimization)
         if not day_change:
             new_days.append(day)
-            continue    
+            # Still fold this day's already-solved actuals into the running
+            # cumulative deviation using whatever target it was solved
+            # against, so later re-optimized days account for it.
+            prior_target = day.get("adjusted_target") or global_daily_target
+            if prior_target and day.get("totals"):
+                cumulative_deviation = update_cumulative_deviation(
+                    cumulative_deviation, prior_target, day["totals"]
+                )
+            continue
         # 2. Determine baseline target for this specific day
         #    If the day was adjusted previously, re-use that. Otherwise,
         #    fall back to the global daily target.
@@ -274,6 +293,10 @@ def apply_changes_and_optimize(
             if adjusted_target.get("kcal") is not None:
                 adjusted_target["kcal"] = round(adjusted_target["kcal"] * (1 - pct), 2)
 
+        # 5b. Fold in weekly carry-over from prior days this week (capped at
+        #     +/-25% of this day's own baseline target so a bad prior day
+        #     can't wreck this day's culinary quality).
+        adjusted_target = apply_weekly_carryover(adjusted_target, cumulative_deviation)
 
         # 6. Prepare recipes_by_meal for optimization
         recipes_by_meal: Dict[str, Dict[str, Any]] = {
@@ -296,6 +319,10 @@ def apply_changes_and_optimize(
         adjusted_target,
         allow_under_kcal=(reduce_macros_pct > 0)
             )
+
+        cumulative_deviation = update_cumulative_deviation(
+            cumulative_deviation, adjusted_target, day_totals
+        )
 
         # 8. Group optimized subrecipes back by meal_key
         subs_by_meal: Dict[str, List[Dict[str, Any]]] = {

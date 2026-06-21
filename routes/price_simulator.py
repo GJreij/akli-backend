@@ -76,6 +76,13 @@ def simple_price_simulator():
         2
     )
 
+    # Task 3: customer-facing pricing is weekly, not daily. This endpoint
+    # only receives a single day's macros as input (it's a simulator, not a
+    # solved week), so the weekly figure here is the same per-gram formula
+    # applied to grams x 7 — equivalent to summing 7 identical days, which
+    # is the simulator's best available approximation of a real week.
+    avg_week_price = round(avg_day_price * 7, 2)
+
     return jsonify({
         "inputs": {
             "protein_g": protein_g,
@@ -87,6 +94,7 @@ def simple_price_simulator():
             "apply_kcal_discount": apply_kcal_discount
         },
         "avg_day_price": avg_day_price,
+        "avg_week_price": avg_week_price,
         "breakdown": {
             "prices_used": {
                 "protein_price_per_g": prices["protein_price_per_g"],

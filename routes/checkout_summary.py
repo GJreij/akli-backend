@@ -71,11 +71,25 @@ def checkout_summary():
 
     # ------------------------------------------------------------------
     # STEP 2 — Aggregate macros & base pricing
+    #
+    # NOTE on billing model: pricing is per-gram (protein/carbs/fat * price
+    # per gram + packaging), and that formula is unchanged here. What
+    # changed is the UNIT it's applied to: grams are now summed across the
+    # whole week FIRST, and the per-gram formula is applied ONCE to the
+    # weekly total — instead of computing 7 separate daily prices and
+    # showing all 7 to the customer. Daily prices are still computed below
+    # (kitchen/ops + delivery-per-day logic depends on them) but they are no
+    # longer the customer-facing billing unit.
     # ------------------------------------------------------------------
     kcal_values, protein_values, carbs_values, fat_values = [], [], [], []
     total_meals = 0
     total_price = 0
     daily_price_details = []
+
+    # Weekly actual-vs-target accuracy (Task 2) and weekly gram totals
+    # (Task 3) — summed across all days as we walk the loop.
+    week_actual = {"protein": 0.0, "carbs": 0.0, "fat": 0.0, "kcal": 0.0}
+    week_target = {"protein": 0.0, "carbs": 0.0, "fat": 0.0, "kcal": 0.0}
 
     for day in days:
         totals = day.get("totals", {})
@@ -86,6 +100,21 @@ def checkout_summary():
             protein_values.append(totals.get("protein", 0))
             carbs_values.append(totals.get("carbs", 0))
             fat_values.append(totals.get("fat", 0))
+
+            week_actual["protein"] += totals.get("protein", 0) or 0
+            week_actual["carbs"]   += totals.get("carbs", 0) or 0
+            week_actual["fat"]     += totals.get("fat", 0) or 0
+            week_actual["kcal"]    += totals.get("kcal", 0) or 0
+
+        # Target used for this day: prefer the day's own adjusted_target
+        # (set by the weekly-carryover solver pipeline), fall back to the
+        # plan-root daily_macro_target so older plans without per-day
+        # targets still produce a sensible weekly accuracy figure.
+        day_target = day.get("adjusted_target") or plan.get("daily_macro_target") or {}
+        week_target["protein"] += float(day_target.get("protein_g") or 0)
+        week_target["carbs"]   += float(day_target.get("carbs_g") or 0)
+        week_target["fat"]     += float(day_target.get("fat_g") or 0)
+        week_target["kcal"]    += float(day_target.get("kcal") or 0)
 
         for meal in day.get("meals", []):
             total_meals += 1
@@ -111,6 +140,43 @@ def checkout_summary():
             "total_price": round(day_price, 2),
             "meals": len(day.get("meals", []))
         })
+
+    # ------------------------------------------------------------------
+    # STEP 2b — Weekly price computed from SUMMED grams (Task 3)
+    #
+    # Same exact per-gram formula as above (base_macro_cost + kcal
+    # discount + packaging), just applied once to the week's total grams
+    # instead of once per day. Packaging is summed per-day-occurred since
+    # day/recipe/subrecipe containers are a real per-day operational cost
+    # regardless of billing granularity.
+    # ------------------------------------------------------------------
+    week_base_macro_cost = (
+        week_actual["protein"] * protein_price
+        + week_actual["carbs"] * carbs_price
+        + week_actual["fat"] * fat_price
+    )
+    week_discount_pct = get_kcal_discount(
+        (week_actual["kcal"] / number_of_days) if number_of_days else 0
+    )
+    week_macro_cost = week_base_macro_cost * (1 - week_discount_pct)
+
+    # ------------------------------------------------------------------
+    # STEP 2c — Weekly accuracy: actual vs target, as % of goal per macro
+    # (Task 2). tolerance_used is computed per-day inside the solver but
+    # was never surfaced to the frontend; this is the disclosed, weekly,
+    # human-readable form of it.
+    # ------------------------------------------------------------------
+    def _pct_of_goal(actual: float, target: float) -> int:
+        if not target:
+            return 100 if not actual else 0
+        return round((actual / target) * 100)
+
+    weekly_accuracy = {
+        "protein_pct": _pct_of_goal(week_actual["protein"], week_target["protein"]),
+        "carbs_pct":   _pct_of_goal(week_actual["carbs"], week_target["carbs"]),
+        "fat_pct":     _pct_of_goal(week_actual["fat"], week_target["fat"]),
+        "kcal_pct":    _pct_of_goal(week_actual["kcal"], week_target["kcal"]),
+    }
 
     # ------------------------------------------------------------------
     # STEP 3 — Apply promo code
@@ -181,6 +247,25 @@ def checkout_summary():
     avg_fat = round(statistics.mean(fat_values), 1) if fat_values else 0
 
     # ------------------------------------------------------------------
+    # STEP 5b — Weekly price (Task 3): the same promo discount_ratio and
+    # total delivery_fee computed above (from the per-day breakdown) are
+    # applied to the gram-summed weekly macro cost, so the customer sees
+    # ONE weekly number that is internally consistent with the (still
+    # per-day, ops-facing) daily_breakdown total — both derive from the
+    # same promo/delivery inputs, just a different grams aggregation.
+    # ------------------------------------------------------------------
+    weekly_packaging_total = (
+        day_packaging_price * number_of_days
+        + recipe_packaging_price * sum(len(d.get("meals", [])) for d in days)
+        + subrecipe_packaging_price * sum(
+            len(m.get("subrecipes", [])) for d in days for m in d.get("meals", [])
+        )
+    )
+    weekly_price_before_discount = round(week_macro_cost + weekly_packaging_total, 2)
+    weekly_price_after_discount = round(weekly_price_before_discount * discount_ratio, 2)
+    weekly_price_final = round(weekly_price_after_discount + delivery_fee, 2)
+
+    # ------------------------------------------------------------------
     # STEP 6 — Response
     # ------------------------------------------------------------------
     summary = {
@@ -192,6 +277,10 @@ def checkout_summary():
             "avg_carbs": avg_carbs,
             "avg_fat": avg_fat,
         },
+        # Task 2: weekly accuracy, disclosed rather than dropped — the
+        # solver's per-day tolerance_used never reached the frontend before;
+        # this is the simple weekly percent-of-goal form of that signal.
+        "weekly_accuracy": weekly_accuracy,
         "price_breakdown": {
             "protein_price_per_g": protein_price,
             "carbs_price_per_g": carbs_price,
@@ -219,7 +308,20 @@ def checkout_summary():
             "promo_message": promo_result["promo_message"],
             "promo_code_id": promo_result.get("promo_code_id"),
 
-            # ✅ This must be the final breakdown including delivery flags/fees
+            # Task 3: ONE weekly price, computed by applying the unchanged
+            # per-gram formula to the week's SUMMED actual grams. This is
+            # the number meant to be shown to the customer as "the price."
+            "weekly_price": {
+                "price_before_discount": weekly_price_before_discount,
+                "discount_amount": round(weekly_price_before_discount - weekly_price_after_discount, 2),
+                "price_before_delivery": weekly_price_after_discount,
+                "delivery_fee": round(delivery_fee, 2),
+                "final_price": weekly_price_final,
+            },
+
+            # Kept for kitchen/ops use (delivery-per-day eligibility,
+            # operational cost tracking) — no longer the customer-facing
+            # billing unit, see "weekly_price" above.
             "daily_breakdown": final_daily_breakdown
         }
     }
