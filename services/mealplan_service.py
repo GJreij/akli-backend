@@ -636,3 +636,132 @@ def optimize_subrecipes(
     return _safe_fallback(
         all_subs, recipes_by_meal, P_t, C_t, F_t, kcal_t, allow_under_kcal
     )
+
+
+# =============================================================================
+# WEEKLY CARRY-OVER BALANCING
+# =============================================================================
+
+# Fraction of the accrued cumulative deviation that gets folded into the next
+# day's target. Kept modest so a single bad day nudges, rather than forces,
+# the following day.
+CARRYOVER_FRACTION = 0.5
+
+# Hard cap: an adjusted target may never drift more than this fraction away
+# from the original (un-adjusted) target for that day, in either direction.
+CARRYOVER_MAX_ADJUST_PCT = 0.25
+
+# Keys this function will adjust if present in macro_target / actual totals.
+_CARRYOVER_KEYS = ("protein_g", "carbs_g", "fat_g", "kcal")
+
+# Maps a macro_target key to the corresponding key used in a day's solved
+# `day_totals` dict (returned by optimize_subrecipes).
+_TARGET_TO_TOTALS_KEY = {
+    "protein_g": "protein",
+    "carbs_g":   "carbs",
+    "fat_g":     "fat",
+    "kcal":      "kcal",
+}
+
+
+def apply_weekly_carryover(
+    base_target: Dict[str, float],
+    cumulative_deviation: Dict[str, float],
+    carryover_fraction: float = CARRYOVER_FRACTION,
+    max_adjust_pct: float = CARRYOVER_MAX_ADJUST_PCT,
+) -> Dict[str, float]:
+    """
+    Compute an adjusted macro_target for "today", nudging it to compensate
+    for the accrued deviation (actual - target) from previous days in the
+    same week.
+
+    This is purely a target-shaping step fed INTO optimize_subrecipes — it
+    does not touch the LP/tolerance ladder at all, and is fully backward
+    compatible: any single-day caller can simply not call this function and
+    pass its original macro_target straight into optimize_subrecipes as
+    before.
+
+    Parameters
+    ----------
+    base_target : the day's normal (un-adjusted) macro_target, e.g.
+                  { protein_g, carbs_g, fat_g, kcal }
+    cumulative_deviation : accrued (actual - target) summed over all
+                  previous days this week, using the SAME keys as
+                  base_target (protein_g, carbs_g, fat_g, kcal). A positive
+                  value means the week is running OVER on that macro so far
+                  (today's target gets nudged down); negative means UNDER
+                  (today's target gets nudged up).
+    carryover_fraction : how much of the cumulative deviation to fold in
+                  (0 = no carryover / identical to base_target, 1 = fully
+                  compensate in a single day).
+    max_adjust_pct : safety cap — the adjusted target is clamped to within
+                  +/- this fraction of base_target, so one very bad day
+                  cannot wreck the next day's culinary quality.
+
+    Returns
+    -------
+    A new dict (base_target is not mutated) with the same keys as
+    base_target, where each numeric macro key listed in _CARRYOVER_KEYS has
+    been adjusted (clamped) and all other keys are passed through unchanged.
+    """
+    adjusted: Dict[str, float] = dict(base_target)
+
+    for key in _CARRYOVER_KEYS:
+        base_val = base_target.get(key)
+        if base_val is None:
+            continue
+        base_val = float(base_val)
+
+        dev = float(cumulative_deviation.get(key) or 0.0)
+
+        # Subtract a fraction of the cumulative deviation: if we've been
+        # running OVER (dev > 0), pull today's target down; if UNDER
+        # (dev < 0), push today's target up.
+        candidate = base_val - carryover_fraction * dev
+
+        # Clamp to +/- max_adjust_pct of the ORIGINAL target for this day.
+        lower = base_val * (1.0 - max_adjust_pct)
+        upper = base_val * (1.0 + max_adjust_pct)
+        if lower > upper:  # guard against negative base_val edge case
+            lower, upper = upper, lower
+        candidate = max(lower, min(upper, candidate))
+
+        adjusted[key] = candidate
+
+    return adjusted
+
+
+def update_cumulative_deviation(
+    cumulative_deviation: Dict[str, float],
+    day_target: Dict[str, float],
+    day_totals: Dict[str, Any],
+) -> Dict[str, float]:
+    """
+    Helper for callers running a week-long loop: fold one more solved day
+    into the running cumulative_deviation dict (actual - target, summed
+    across days so far), returning a NEW dict.
+
+    `day_target` should be the target that was actually fed into
+    optimize_subrecipes for that day (i.e. the adjusted_target if carryover
+    was applied), and `day_totals` is the third tuple element returned by
+    optimize_subrecipes (contains protein/carbs/fat/kcal actuals).
+
+    Skips updating a key if day_totals' tolerance_used indicates the greedy
+    fallback path with no numeric totals, but in practice protein/carbs/fat/
+    kcal are always present and numeric in day_totals, so this is mainly a
+    defensive guard.
+    """
+    updated = dict(cumulative_deviation)
+
+    for key in _CARRYOVER_KEYS:
+        target_val = day_target.get(key)
+        if target_val is None:
+            continue
+        totals_key = _TARGET_TO_TOTALS_KEY[key]
+        actual_val = day_totals.get(totals_key)
+        if actual_val is None:
+            continue
+        prev = float(updated.get(key) or 0.0)
+        updated[key] = prev + (float(actual_val) - float(target_val))
+
+    return updated

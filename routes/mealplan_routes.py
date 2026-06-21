@@ -4,7 +4,11 @@ from collections import deque, defaultdict
 import random
 
 from utils.supabase_client import supabase
-from services.mealplan_service import optimize_subrecipes
+from services.mealplan_service import (
+    optimize_subrecipes,
+    apply_weekly_carryover,
+    update_cumulative_deviation,
+)
 from utils.event_logger import log_event
 
 mealplan_bp = Blueprint("mealplan", __name__)
@@ -858,7 +862,12 @@ def generate_meal_plan():
     yesterday_recipe_ids: set       = set()
     yesterday_categories: frozenset = frozenset()
 
-    for date in available_dates:
+    # Weekly carry-over: tracks accrued (actual - target) per macro across
+    # the days generated so far in this call, so day N+1's target can be
+    # nudged to compensate for day N's misses (see mealplan_service.py).
+    cumulative_deviation: dict = {"protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0, "kcal": 0.0}
+
+    for day_index, date in enumerate(available_dates):
         allowed_ids_today = allowed_recipe_ids_by_date.get(date, set())
 
         recipes_by_meal = get_or_create_daily_template(
@@ -897,9 +906,21 @@ def generate_meal_plan():
             *(categories.get(rid, frozenset()) for rid in yesterday_recipe_ids)
         )
 
-        # Run macro optimizer
+        # Run macro optimizer — first day of the week uses the plain target;
+        # subsequent days get a carryover-adjusted target that nudges for
+        # whatever the week has under/over-shot so far (capped at +/-25%
+        # of that day's original target).
+        if day_index == 0:
+            day_target = target_with_kcal
+        else:
+            day_target = apply_weekly_carryover(target_with_kcal, cumulative_deviation)
+
         optimized_subs, loss, day_totals = optimize_subrecipes(
-            recipes_by_meal, target_with_kcal
+            recipes_by_meal, day_target
+        )
+
+        cumulative_deviation = update_cumulative_deviation(
+            cumulative_deviation, day_target, day_totals
         )
 
         # Group optimized subrecipes back by meal slot
@@ -945,6 +966,11 @@ def generate_meal_plan():
             "macro_error": loss,
             "totals":      day_totals,
             "meals":       meals_list,
+            # Persisted so a later /update_meal_plan re-optimization (see
+            # mealplan_update_dynamic_service.py) carries the same
+            # carryover-adjusted target forward instead of reverting to the
+            # flat global target.
+            "adjusted_target": day_target,
         })
 
     log_event(user_id, "meal_plan_generated", {
