@@ -1,9 +1,14 @@
 # services/order_service.py
 
-from utils.supabase_client import supabase
+import os
+import requests
+from utils.supabase_client import supabase, SUPABASE_URL, SUPABASE_KEY
 from datetime import datetime, timedelta
 
 DEFAULT_MAX_DELIVERIES = 20
+
+NOTIFY_URL = f"{SUPABASE_URL}/functions/v1/meal-plan-notify"
+NOTIFY_WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "akli_webhook_3f9c2b8d_202")
 
 
 class OrderService:
@@ -83,7 +88,7 @@ class OrderService:
         )
 
         # 8) persist meal plan bundle & get mapping meal_date -> meal_plan_day_id
-        day_to_meal_plan_day_id = self._store_meal_plan_bundle(
+        day_to_meal_plan_day_id, meal_plan_record = self._store_meal_plan_bundle(
             user_id=user_id,
             meal_plan=meal_plan,
             deliveries_map=deliveries_map,   # keyed by delivery_date
@@ -98,6 +103,12 @@ class OrderService:
             day_to_meal_plan_day_id=day_to_meal_plan_day_id,
             payment_method=payment_method,
         )
+
+        # 10) notify admin now that payment rows exist (the order email needs
+        # the payment method, which isn't written until step 9 — sending the
+        # notification here instead of via a meal_plan INSERT trigger avoids
+        # firing before the payment row exists)
+        self._notify_order_email(meal_plan_record)
         # Save promo_code_usage if promo was valid
         price_info = checkout_summary.get("price_breakdown", {})
         promo_code_id = price_info.get("promo_code_id")
@@ -362,6 +373,7 @@ class OrderService:
         update deliveries.meal_plan_day_id, then recipes & subrecipes.
         Returns:
           day_to_meal_plan_day_id: {meal_date_str: meal_plan_day_id}
+          meal_plan_record: the inserted meal_plan row
         """
         now = datetime.utcnow().isoformat()
 
@@ -378,7 +390,8 @@ class OrderService:
             )
             .execute()
         )
-        plan_id = plan_ins.data[0]["id"]
+        meal_plan_record = plan_ins.data[0]
+        plan_id = meal_plan_record["id"]
 
         day_to_meal_plan_day_id = {}
 
@@ -499,7 +512,29 @@ class OrderService:
                         .execute()
                     )
 
-        return day_to_meal_plan_day_id
+        return day_to_meal_plan_day_id, meal_plan_record
+
+    def _notify_order_email(self, meal_plan_record):
+        """Trigger the admin order-confirmation email now that the payment
+        row for this order has been written."""
+        try:
+            requests.post(
+                NOTIFY_URL,
+                json={
+                    "type": "INSERT",
+                    "schema": "public",
+                    "table": "meal_plan",
+                    "record": meal_plan_record,
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "x-webhook-secret": NOTIFY_WEBHOOK_SECRET,
+                },
+                timeout=5,
+            )
+        except requests.RequestException:
+            pass  # order is already confirmed; don't fail the request over a notify error
 
     def _create_payment_record(
         self,
