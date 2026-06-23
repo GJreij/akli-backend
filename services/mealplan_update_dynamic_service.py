@@ -81,7 +81,7 @@ def consolidate_changes(change_logs: List[Dict[str, Any]]) -> Dict[str, Any]:
                         "include_macros_in_rest", True
                     ),
                 }
-            elif last_log.get("new_recipe_id") and not last_log.get("Delete"):
+            elif last_log.get("new_recipe_id") and last_log.get("old_recipe_id"):
                 day_actions[meal_key] = {
                     "action": "replace",
                     "old_recipe_id": last_log.get("old_recipe_id"),
@@ -89,6 +89,15 @@ def consolidate_changes(change_logs: List[Dict[str, Any]]) -> Dict[str, Any]:
                     "include_macros_in_rest": last_log.get(
                         "include_macros_in_rest", True
                     ),
+                }
+            elif last_log.get("new_recipe_id") and not last_log.get("old_recipe_id"):
+                # Brand-new meal added to a slot that didn't exist on this day
+                # before (either it was removed earlier, or excluded entirely
+                # from the original plan generation).
+                day_actions[meal_key] = {
+                    "action": "add",
+                    "new_recipe_id": last_log.get("new_recipe_id"),
+                    "meal_type": last_log.get("meal_type"),
                 }
 
         if day_actions:
@@ -209,16 +218,17 @@ def apply_changes_and_optimize(
                     cumulative_deviation, prior_target, day["totals"]
                 )
             continue
-        # 2. Determine baseline target for this specific day
-        #    If the day was adjusted previously, re-use that. Otherwise,
-        #    fall back to the global daily target.
-        baseline_target: Dict[str, Any] = day.get("adjusted_target") or global_daily_target
+        # 2. Track which meal types are currently excluded as "eating out"
+        #    (persisted across calls) — this is the source of truth for the
+        #    day's target reduction, so re-adding a meal can reverse exactly
+        #    its own contribution instead of guessing from a compounded number.
+        eating_out_set: set = set(day.get("eating_out_meal_types", []))
 
         updated_meals: List[Dict[str, Any]] = []
         deleted_meal_types_for_day = set()
-        reduce_macros_pct = 0.0  # cumulative % reduction of daily macros
+        added_meal_types_for_day = set()
 
-        # 3. Apply meal-level changes (replace/delete) and track reductions
+        # 3. Apply meal-level changes (replace/delete) for meals that already exist
         for meal in day.get("meals", []):
             meal_key = meal["meal_key"]
             meal_type = meal["meal_type"]
@@ -264,23 +274,60 @@ def apply_changes_and_optimize(
                     continue
                 else:
                     # Eating out → reduce the daily target by a fixed percentage
-                    if meal_type == "breakfast":
-                        reduce_macros_pct += 0.30
-                    elif meal_type == "snack":
-                        reduce_macros_pct += 0.20
-                    elif meal_type in ["lunch", "dinner"]:
-                        reduce_macros_pct += 0.40
-
-                    # We still drop the meal entirely from the day
+                    eating_out_set.add(meal_type)
                     continue
 
-        # 4. If all meal types of the day were deleted → drop the entire day
-        #    (we consider there are 4 possible meal types in the system)
-        if len(deleted_meal_types_for_day) >= 4:
+        # 3b. Apply "add" actions — brand-new meal_keys that don't correspond
+        #     to a meal already on this day (re-added after removal, or a
+        #     meal type that wasn't on the day at all before).
+        existing_meal_keys = {m["meal_key"] for m in day.get("meals", [])}
+        for meal_key, change in (day_change or {}).items():
+            if change.get("action") != "add" or meal_key in existing_meal_keys:
+                continue
+
+            new_recipe_id = change.get("new_recipe_id")
+            meal_type = change.get("meal_type")
+            if not new_recipe_id or not meal_type:
+                continue
+
+            new_recipe = fetch_recipe_details(new_recipe_id)
+            if not new_recipe:
+                continue
+
+            updated_meals.append(
+                {
+                    "meal_key": meal_key,
+                    "meal_type": meal_type,
+                    "recipe_id": new_recipe["recipe_id"],
+                    "recipe_name": new_recipe["recipe_name"],
+                    "photo": new_recipe["photo"],
+                    "subrecipes": new_recipe["subrecipes"],
+                    "macros": new_recipe["macros"],
+                }
+            )
+            added_meal_types_for_day.add(meal_type)
+            # Re-adding a meal type reverses its own "eating out" exclusion,
+            # giving its share of the daily target back.
+            eating_out_set.discard(meal_type)
+
+        # 4. If all meal types of the day were deleted (and none re-added) →
+        #    drop the entire day (we consider there are 4 possible meal types).
+        if len(deleted_meal_types_for_day - added_meal_types_for_day) >= 4:
             continue
 
-        # 5. Adjust macro target based on reduced percentage
-        adjusted_target = copy.deepcopy(baseline_target)
+        # 5. Recompute the macro target fresh from the global target and the
+        #    current eating-out set (always — never compounded from a
+        #    previous adjusted_target, so add-back is an exact reversal).
+        reduce_macros_pct = 0.0
+        for meal_type in eating_out_set:
+            if meal_type == "breakfast":
+                reduce_macros_pct += 0.30
+            elif meal_type == "snack":
+                reduce_macros_pct += 0.20
+            elif meal_type in ("lunch", "dinner"):
+                reduce_macros_pct += 0.40
+
+        adjusted_target = copy.deepcopy(global_daily_target)
 
         if reduce_macros_pct > 0:
             pct = min(reduce_macros_pct, 1.0)
@@ -289,7 +336,6 @@ def apply_changes_and_optimize(
                 if adjusted_target.get(key) is not None:
                     adjusted_target[key] = round(adjusted_target[key] * (1 - pct), 2)
 
-            # 🔴 THIS WAS MISSING
             if adjusted_target.get("kcal") is not None:
                 adjusted_target["kcal"] = round(adjusted_target["kcal"] * (1 - pct), 2)
 
@@ -360,6 +406,8 @@ def apply_changes_and_optimize(
             meal["subrecipes"] = sub_list
 
         # 10. Construct the updated day, including the persisted adjusted_target
+        #     and the eating-out set (the latter is what's actually replayed
+        #     to recompute adjusted_target on every future update — see step 5).
         updated_day = {
             "date": date,
             "weekday": day["weekday"],
@@ -367,9 +415,8 @@ def apply_changes_and_optimize(
             "macro_error": loss,
             "totals": day_totals,
             "meals": updated_meals,
-            # Persist day-specific target so that future updates
-            # keep the same reservation of calories.
             "adjusted_target": adjusted_target,
+            "eating_out_meal_types": sorted(eating_out_set),
         }
 
         new_days.append(updated_day)
