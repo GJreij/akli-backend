@@ -176,33 +176,90 @@ def _safe_fallback(
     """
     Greedy fallback: start at 1 serving each, then greedily add servings to
     minimise protein deficit first (protein/kcal ratio), then to fill calories.
+
+    Every candidate serving bump is checked against the same RELAXED culinary
+    caps the LP's Pass 2 enforces (meal-type kcal share, dinner/lunch balance,
+    intra-meal serving ratio) — see `_respects_balance_caps` below. Without
+    this, a day made of single-subrecipe meals (the LP's hardest case, since
+    each meal is then just "N copies of one fixed-macro block") could hit this
+    fallback and have the greedy kcal-fill phase dump almost the entire day's
+    calories into whichever single recipe has the highest kcal/serving —
+    producing a lopsided plate (e.g. a 1800 kcal lunch next to a 250 kcal
+    dinner) even though the day's macro *totals* look perfectly on target.
     """
     servings = {i: 1 for i in range(len(all_subs))}
 
-    def best_protein_per_kcal() -> int:
+    meal_of:      Dict[int, str] = {i: s["meal"] for i, s in enumerate(all_subs)}
+    meal_type_of: Dict[int, Any] = {
+        i: recipes_by_meal.get(s["meal"], {}).get("meal_type")
+        for i, s in enumerate(all_subs)
+    }
+    meal_indices: Dict[str, List[int]] = defaultdict(list)
+    for i, s in enumerate(all_subs):
+        meal_indices[s["meal"]].append(i)
+
+    def _kcal_by_meal_type(servs: Dict[int, float]) -> Dict[str, float]:
+        out: Dict[str, float] = defaultdict(float)
+        for i, s in enumerate(all_subs):
+            mt = meal_type_of[i]
+            if mt:
+                out[mt] += servs[i] * s["macros"]["kcal"]
+        return out
+
+    def _respects_balance_caps(idx: int, servs: Dict[int, float]) -> bool:
+        """Would bumping idx's serving by one violate the RELAXED meal-type
+        kcal caps or the intra-meal serving-balance ratio?"""
+        trial = dict(servs)
+        trial[idx] += 1
+
+        siblings = [trial[j] for j in meal_indices[meal_of[idx]] if j != idx]
+        if siblings and trial[idx] > RELAXED_SERVING_BALANCE_RATIO * min(siblings):
+            return False
+
+        by_type = _kcal_by_meal_type(trial)
+        total = sum(by_type.values())
+        if total <= 0:
+            return True
+
+        mt = meal_type_of[idx]
+        if mt == "breakfast" and by_type["breakfast"] > RELAXED_BREAKFAST_MAX_PCT * total:
+            return False
+        if mt == "snack" and by_type["snack"] > RELAXED_SNACK_MAX_PCT * total:
+            return False
+        if "lunch" in by_type and "dinner" in by_type:
+            lunch, dinner = by_type["lunch"], by_type["dinner"]
+            smaller = min(lunch, dinner)
+            if smaller > 0 and abs(lunch - dinner) / smaller > RELAXED_DINNER_LUNCH_DIFF_PCT:
+                return False
+        return True
+
+    def best_protein_per_kcal() -> int | None:
+        candidates = [
+            i for i in range(len(all_subs))
+            if servings[i] < all_subs[i]["max_serving"] and _respects_balance_caps(i, servings)
+        ]
+        if not candidates:
+            return None
         return max(
-            range(len(all_subs)),
-            key=lambda i: (
-                all_subs[i]["macros"]["protein"] / max(all_subs[i]["macros"]["kcal"], 1)
-                if servings[i] < all_subs[i]["max_serving"] else -1
-            ),
+            candidates,
+            key=lambda i: all_subs[i]["macros"]["protein"] / max(all_subs[i]["macros"]["kcal"], 1),
         )
 
-    def best_kcal() -> int:
-        return max(
-            range(len(all_subs)),
-            key=lambda i: (
-                all_subs[i]["macros"]["kcal"]
-                if servings[i] < all_subs[i]["max_serving"] else -1
-            ),
-        )
+    def best_kcal() -> int | None:
+        candidates = [
+            i for i in range(len(all_subs))
+            if servings[i] < all_subs[i]["max_serving"] and _respects_balance_caps(i, servings)
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda i: all_subs[i]["macros"]["kcal"])
 
     totals = _compute_totals(all_subs, servings)
 
     # Phase 1: push protein toward target
     while totals["protein"] < P_t and totals["kcal"] < 1.2 * kcal_t:
         idx = best_protein_per_kcal()
-        if servings[idx] >= all_subs[idx]["max_serving"]:
+        if idx is None:
             break
         servings[idx] += 1
         totals = _compute_totals(all_subs, servings)
@@ -211,7 +268,7 @@ def _safe_fallback(
     if not allow_under_kcal:
         while totals["kcal"] < 0.80 * kcal_t:
             idx = best_kcal()
-            if servings[idx] >= all_subs[idx]["max_serving"]:
+            if idx is None:
                 break
             servings[idx] += 1
             totals = _compute_totals(all_subs, servings)

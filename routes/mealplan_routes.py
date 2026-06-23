@@ -926,6 +926,12 @@ def generate_meal_plan():
             cumulative_deviation, day_target, day_totals
         )
 
+        if day_totals.get("tolerance_used") == "SAFE_FALLBACK":
+            log_event(user_id, "mealplan_lp_fallback", {
+                "date": str(date),
+                "recipe_ids": [info["recipe_id"] for info in recipes_by_meal.values()],
+            })
+
         # Group optimized subrecipes back by meal slot
         subs_by_meal: dict = {k: [] for k in recipes_by_meal}
         for sub in optimized_subs:

@@ -4,6 +4,7 @@ from collections import defaultdict
 import copy
 
 from utils.supabase_client import supabase
+from utils.event_logger import log_event
 from services.mealplan_service import (
     optimize_subrecipes,
     apply_weekly_carryover,
@@ -187,6 +188,7 @@ def apply_changes_and_optimize(
         target instead of going back to the global daily target.
     """
     updated_plan = copy.deepcopy(current_plan)
+    user_id = updated_plan.get("user_id")
 
     # Global target defined at the root of the plan from /generate_meal_plan
     global_daily_target: Dict[str, Any] = updated_plan.get("daily_macro_target", {}) or {}
@@ -369,6 +371,13 @@ def apply_changes_and_optimize(
         cumulative_deviation = update_cumulative_deviation(
             cumulative_deviation, adjusted_target, day_totals
         )
+
+        if day_totals.get("tolerance_used") == "SAFE_FALLBACK":
+            log_event(user_id, "mealplan_lp_fallback", {
+                "date": date,
+                "recipe_ids": [m["recipe_id"] for m in updated_meals],
+                "source": "update_meal_plan",
+            })
 
         # 8. Group optimized subrecipes back by meal_key
         subs_by_meal: Dict[str, List[Dict[str, Any]]] = {
