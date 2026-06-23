@@ -36,11 +36,6 @@ def ingredients_to_buy():
             client=client,
             delivery_slot=delivery_slot,
         )
-        log_event(None, "ingredients_viewed", {
-            "start_date": start_date,
-            "end_date": end_date,
-            "filters_applied": {k: v for k, v in {"recipe": recipe, "client": client, "delivery_slot": delivery_slot}.items() if v},
-        })
         return jsonify(result)
 
     except Exception as e:

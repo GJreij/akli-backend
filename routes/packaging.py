@@ -2,7 +2,6 @@
 
 from flask import Blueprint, request, jsonify
 from services.packaging_service import get_packaging_view
-from utils.event_logger import log_event
 
 packaging_bp = Blueprint("packaging", __name__)
 
@@ -18,5 +17,4 @@ def packaging():
         return jsonify({"error": "start_date and end_date are required"}), 400
 
     result = get_packaging_view(start_date, end_date)
-    log_event(None, "packaging_viewed", {"start_date": start_date, "end_date": end_date})
     return jsonify(result)
