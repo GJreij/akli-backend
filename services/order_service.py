@@ -1,7 +1,7 @@
 # services/order_service.py
 
 import os
-import requests
+import httpx
 from utils.supabase_client import supabase, SUPABASE_URL, SUPABASE_KEY
 from datetime import datetime, timedelta
 
@@ -518,7 +518,7 @@ class OrderService:
         """Trigger the admin order-confirmation email now that the payment
         row for this order has been written."""
         try:
-            requests.post(
+            httpx.post(
                 NOTIFY_URL,
                 json={
                     "type": "INSERT",
@@ -533,7 +533,7 @@ class OrderService:
                 },
                 timeout=5,
             )
-        except requests.RequestException:
+        except httpx.HTTPError:
             pass  # order is already confirmed; don't fail the request over a notify error
 
     def _create_payment_record(
