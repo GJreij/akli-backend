@@ -98,6 +98,7 @@ def validate_and_apply_promo_code(
     promo_code_str: Optional[str],
     total_price: float,
     number_of_days: Optional[int] = None,
+    discount_base: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Validates and applies a promo code.
@@ -106,7 +107,15 @@ def validate_and_apply_promo_code(
     - Keeps the existing usage + date + min order logic, plus a min_order_days
       condition and a max_discount_amount cap.
     - If the code belongs to an affiliate, resolves the commission owed.
+    - min_order_value/min_order_days are always checked against the order's
+      real total_price. The discount percentage itself is computed against
+      discount_base if given (defaults to total_price) — this is how a
+      promo code stacks SEQUENTIALLY on top of an already-applied automatic
+      volume discount, rather than both being computed off the same
+      original price (which would let two 10% deals add up to a flat 20%).
     """
+    if discount_base is None:
+        discount_base = total_price
     # 0) No code provided
     if not promo_code_str or promo_code_str.strip() == "":
         return {
@@ -236,7 +245,7 @@ def validate_and_apply_promo_code(
     discount_type = promo.get("discount_type")
 
     if discount_type == "percentage":
-        discount = total_price * (discount_value / 100.0)
+        discount = discount_base * (discount_value / 100.0)
         msg = f"Promo applied! You saved {discount_value}%."
     elif discount_type == "fixed":
         discount = discount_value
@@ -248,6 +257,7 @@ def validate_and_apply_promo_code(
 
     if promo.get("max_discount_amount") is not None:
         discount = min(discount, float(promo["max_discount_amount"]))
+    discount = min(discount, discount_base)
 
     final_price = max(total_price - discount, 0.0)
 

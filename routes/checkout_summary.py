@@ -184,26 +184,45 @@ def checkout_summary():
     #
     # Volume discounts (automatic_discount_rules) are a different philosophy
     # from promo codes: no code needed, always visible, purely based on order
-    # length. They stack additively with a promo code unless that specific
-    # rule's stackable_with_promo is False, in which case the promo code wins
-    # and the volume discount doesn't apply (an "exclusive" deal).
+    # length. When both apply, the promo code stacks SEQUENTIALLY on top of
+    # the volume discount — i.e. its percentage is computed off the price
+    # that's ALREADY reduced by the volume discount, not the original price.
+    # Two 10% deals therefore compound to 19% off, not a flat 20% — this
+    # protects margin instead of letting stacked percentages add up freely.
+    # If the rule's stackable_with_promo is False, the promo code wins
+    # exclusively instead and the volume discount doesn't apply at all.
     # ------------------------------------------------------------------
     volume_result = apply_volume_discount(total_price, number_of_days)
     volume_discount_amount = volume_result["discount_amount"]
     volume_rule = volume_result["rule"]
+
+    base_after_volume = total_price - volume_discount_amount
 
     promo_result = validate_and_apply_promo_code(
         user_id=user_id,
         promo_code_str=promo_code,
         total_price=total_price,
         number_of_days=number_of_days,
+        discount_base=base_after_volume,
     )
     promo_valid = promo_result["status"] == "valid"
-    promo_discount_amount = promo_result["discount_amount"] if promo_valid else 0.0
 
     stackable = volume_rule["stackable_with_promo"] if volume_rule else True
     if promo_valid and volume_rule and not stackable:
-        volume_discount_amount = 0.0  # exclusive promo wins over the volume tier
+        # Exclusive deal: the volume discount is voided, so the promo's
+        # percentage must be recomputed against the original price instead
+        # of the (now-irrelevant) post-volume base.
+        volume_discount_amount = 0.0
+        promo_result = validate_and_apply_promo_code(
+            user_id=user_id,
+            promo_code_str=promo_code,
+            total_price=total_price,
+            number_of_days=number_of_days,
+            discount_base=total_price,
+        )
+        promo_valid = promo_result["status"] == "valid"
+
+    promo_discount_amount = promo_result["discount_amount"] if promo_valid else 0.0
 
     total_discount = min(volume_discount_amount + promo_discount_amount, total_price)
     final_price_after_discount = round(total_price - total_discount, 2)
