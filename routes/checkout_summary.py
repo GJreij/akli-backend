@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify
 import statistics
 from utils.supabase_client import supabase
 from services.promo_service import validate_and_apply_promo_code
+from services.volume_discount_service import apply_volume_discount
 from utils.event_logger import log_event
 
 checkout_bp = Blueprint("checkout", __name__)
@@ -179,19 +180,34 @@ def checkout_summary():
     }
 
     # ------------------------------------------------------------------
-    # STEP 3 — Apply promo code
+    # STEP 3 — Apply automatic volume discount + promo code
+    #
+    # Volume discounts (automatic_discount_rules) are a different philosophy
+    # from promo codes: no code needed, always visible, purely based on order
+    # length. They stack additively with a promo code unless that specific
+    # rule's stackable_with_promo is False, in which case the promo code wins
+    # and the volume discount doesn't apply (an "exclusive" deal).
     # ------------------------------------------------------------------
+    volume_result = apply_volume_discount(total_price, number_of_days)
+    volume_discount_amount = volume_result["discount_amount"]
+    volume_rule = volume_result["rule"]
+
     promo_result = validate_and_apply_promo_code(
         user_id=user_id,
         promo_code_str=promo_code,
         total_price=total_price,
         number_of_days=number_of_days,
     )
+    promo_valid = promo_result["status"] == "valid"
+    promo_discount_amount = promo_result["discount_amount"] if promo_valid else 0.0
 
-    if promo_result["status"] == "valid" and total_price > 0:
-        discount_ratio = promo_result["final_price"] / total_price
-    else:
-        discount_ratio = 1.0
+    stackable = volume_rule["stackable_with_promo"] if volume_rule else True
+    if promo_valid and volume_rule and not stackable:
+        volume_discount_amount = 0.0  # exclusive promo wins over the volume tier
+
+    total_discount = min(volume_discount_amount + promo_discount_amount, total_price)
+    final_price_after_discount = round(total_price - total_discount, 2)
+    discount_ratio = (final_price_after_discount / total_price) if total_price > 0 else 1.0
 
     discounted_daily_price_details = []
     for day in daily_price_details:
@@ -203,8 +219,6 @@ def checkout_summary():
             "original_total_price": original_price,
             "total_price": discounted_price
         })
-
-    final_price_after_discount = promo_result["final_price"]
 
     # ------------------------------------------------------------------
     # STEP 4 — Delivery fee logic ✅ (per-day minimum, based on PRE-discount)
@@ -295,8 +309,15 @@ def checkout_summary():
             "subrecipe_packaging_price": subrecipe_packaging_price,
 
             "total_price_before_discount": round(total_price, 2),
-            "discount_amount": promo_result["discount_amount"],
+            "discount_amount": round(total_discount, 2),
             "final_price_before_delivery": final_price_after_discount,
+
+            "volume_discount": {
+                "amount": volume_discount_amount,
+                "rule_name": volume_rule["name"] if volume_rule else None,
+                "min_order_days": volume_rule["min_order_days"] if volume_rule else None,
+            },
+            "promo_discount_amount": promo_discount_amount,
 
             "delivery": {
                 "fee_per_day": delivery_price_per_day,
