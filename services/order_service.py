@@ -25,7 +25,7 @@ class OrderService:
           3) Map meal days -> delivery days based on AM/PM logic
           4) Capacity checks & ensure delivery_slots_daily rows (bulk)
           5) Upsert user_delivery_preference
-          6) Resolve delivery address (required) + partner via partner_client_link
+          6) Resolve delivery address (required)
           7) Create deliveries and increment slot counts (for delivery days)
           8) Create meal_plan + meal_plan_day (+ link correct deliveries)
           9) Create payment rows linked to meal_plan_day
@@ -76,8 +76,6 @@ class OrderService:
         if not resolved_address:
             return {"error": "A delivery address is required to confirm this order."}, 400
 
-        partner_id = self._fetch_partner_id(user_id)
-
         # 7) create deliveries + increment counts (uses DELIVERY days)
         deliveries_map = self._create_deliveries_and_increment_counts(
             user_id=user_id,
@@ -98,7 +96,6 @@ class OrderService:
         # 9) payment
         self._create_payment_record(
             ordered_user_id=user_id,
-            partner_id=partner_id,
             checkout_summary=checkout_summary,
             day_to_meal_plan_day_id=day_to_meal_plan_day_id,
             payment_method=payment_method,
@@ -280,18 +277,6 @@ class OrderService:
             return default_res.data[0]["address_text"]
 
         return None
-
-    def _fetch_partner_id(self, user_id):
-        """partner via partner_client_link (latest/active row if multiple)."""
-        partner_res = (
-            self.sb.table("partner_client_link")
-            .select("partner_id, start_date")
-            .eq("client_id", user_id)
-            .order("start_date", desc=True)  # latest if multiple
-            .limit(1)
-            .execute()
-        )
-        return partner_res.data[0]["partner_id"] if partner_res.data else None
 
     def _create_deliveries_and_increment_counts(
         self,
@@ -539,7 +524,6 @@ class OrderService:
     def _create_payment_record(
         self,
         ordered_user_id,
-        partner_id,
         checkout_summary,
         day_to_meal_plan_day_id,
         payment_method=None,
@@ -547,9 +531,16 @@ class OrderService:
         """
         Create one payment per meal day, linked to meal_plan_day.
         Uses in-memory map instead of SELECT per day.
+
+        Affiliate commission (if the order used an affiliate's promo code) is
+        snapshotted onto each payment row at the rate resolved by
+        promo_service at checkout time, so later rate changes don't affect
+        already-placed orders.
         """
         price_breakdown = checkout_summary.get("price_breakdown") or {}
         daily_breakdown = price_breakdown.get("daily_breakdown") or []
+        affiliate_id = price_breakdown.get("affiliate_id")
+        commission_rate = price_breakdown.get("commission_rate")
 
         now = datetime.utcnow().isoformat()
 
@@ -568,18 +559,26 @@ class OrderService:
             if not meal_plan_day_id:
                 raise ValueError(f"Missing meal_plan_day_id for date {date_str}")
 
+            commission_amount = (
+                round(amount * float(commission_rate), 2)
+                if affiliate_id and commission_rate is not None
+                else None
+            )
+
             (
                 self.sb.table("payment")
                 .insert(
                     {
                         "ordered_user_id": ordered_user_id,
-                        "partner_at_order": partner_id,
                         "amount": amount,
                         "status": "pending",
                         "provider": payment_method,
                         "provider_payment_id": None,
                         "currency": "USD",
                         "meal_plan_day_id": meal_plan_day_id,
+                        "affiliate_id": affiliate_id,
+                        "commission_rate": commission_rate,
+                        "commission_amount": commission_amount,
                         "created_at": now,
                     }
                 )

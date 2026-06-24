@@ -59,7 +59,7 @@ serve(async (req) => {
 
   const fullName = user
     ? `${user.name ?? ""} ${user.last_name ?? ""}`.trim()
-    : "Unknown";
+    : "Unknown"; 
 
   // 3b) Resolve the actual delivery address used for this order — the user
   // table no longer carries a single delivery_address column; addresses now

@@ -184,7 +184,8 @@ def checkout_summary():
     promo_result = validate_and_apply_promo_code(
         user_id=user_id,
         promo_code_str=promo_code,
-        total_price=total_price
+        total_price=total_price,
+        number_of_days=number_of_days,
     )
 
     if promo_result["status"] == "valid" and total_price > 0:
@@ -207,7 +208,11 @@ def checkout_summary():
 
     # ------------------------------------------------------------------
     # STEP 4 — Delivery fee logic ✅ (per-day minimum, based on PRE-discount)
+    # A promo code can waive delivery entirely (e.g. an Athlete's free-service
+    # personal code), independent of the per-day minimum-order-value logic.
     # ------------------------------------------------------------------
+    waives_delivery = promo_result["status"] == "valid" and bool(promo_result.get("waives_delivery"))
+
     delivery_days = 0
     delivery_fee = 0
 
@@ -220,7 +225,7 @@ def checkout_summary():
         original_total = day["original_total_price"]
 
         # ✅ eligibility based on PRE-discount total
-        needs_delivery = original_total < DELIVERY_DAY_MINIMUM
+        needs_delivery = original_total < DELIVERY_DAY_MINIMUM and not waives_delivery
         day_delivery_fee = delivery_price_per_day if needs_delivery else 0
 
         if needs_delivery:
@@ -298,7 +303,8 @@ def checkout_summary():
                 "minimum_per_day_for_free_delivery": DELIVERY_DAY_MINIMUM,
                 "delivery_days": delivery_days,
                 "delivery_fee": round(delivery_fee, 2),
-                "is_free_delivery": delivery_fee == 0
+                "is_free_delivery": delivery_fee == 0,
+                "waived_by_promo": waives_delivery,
             },
 
             "final_price": final_price_with_delivery,
@@ -307,6 +313,8 @@ def checkout_summary():
             "promo_code_used": promo_code,
             "promo_message": promo_result["promo_message"],
             "promo_code_id": promo_result.get("promo_code_id"),
+            "affiliate_id": promo_result.get("affiliate_id"),
+            "commission_rate": promo_result.get("commission_rate"),
 
             # Task 3: ONE weekly price, computed by applying the unchanged
             # per-gram formula to the week's SUMMED actual grams. This is
