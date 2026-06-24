@@ -559,8 +559,12 @@ class OrderService:
             if not meal_plan_day_id:
                 raise ValueError(f"Missing meal_plan_day_id for date {date_str}")
 
+            # Commission is earned on the food price only, not the delivery
+            # fee — day_data["total_price"] is the post-discount meal price
+            # before delivery is added (see checkout_summary.py STEP 3/4).
+            commission_base = float(day_data.get("total_price") or 0)
             commission_amount = (
-                round(amount * float(commission_rate), 2)
+                round(commission_base * float(commission_rate), 2)
                 if affiliate_id and commission_rate is not None
                 else None
             )
