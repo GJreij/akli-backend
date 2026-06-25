@@ -14,10 +14,13 @@ from utils.supabase_client import supabase
 # =============================================================================
 
 # Tolerance ladder: solver tries each in order, first feasible wins.
-KCAL_TOLERANCES  = [0.08, 0.10, 0.15, 0.20, 0.40]
+# Capped at 20% max — anything looser than that is no longer treated as
+# "solved"; BEST_EFFORT_LP (see below) takes over instead of stretching
+# the band further.
+KCAL_TOLERANCES  = [0.08, 0.10, 0.15, 0.20]
 # Paired macro tolerance ladder — slightly wider than kcal since individual
 # macros are harder to hit exactly with discrete integer servings.
-MACRO_TOLERANCES = [0.12, 0.15, 0.20, 0.30, 0.40]
+MACRO_TOLERANCES = [0.12, 0.15, 0.18, 0.20]
 
 # Half-step granularity tried after integer step fails for each tolerance.
 SERVING_STEP_FINE = 0.5
@@ -59,9 +62,6 @@ STRICT_SNACK_MAX_PCT           = 0.25
 STRICT_DINNER_LUNCH_DIFF_PCT   = 0.40   # |dinner - lunch| / smaller <= 40 %
 STRICT_NO_DINNER_YES_LUNCH_PCT = 0.60
 STRICT_NO_LUNCH_YES_DINNER_PCT = 0.60
-# Intra-meal balance: no subrecipe may exceed RATIO × any other subrecipe in
-# the same meal.  Prevents "3 Greek yogurts / ½ granola" style domination.
-STRICT_SERVING_BALANCE_RATIO   = 2.5
 
 # ── RELAXED culinary constraints (Pass 2) ────────────────────────────────────
 # Slightly wider caps so the LP has more room when strict constraints cause
@@ -71,7 +71,13 @@ STRICT_SERVING_BALANCE_RATIO   = 2.5
 RELAXED_BREAKFAST_MAX_PCT      = 0.50
 RELAXED_SNACK_MAX_PCT          = 0.35
 RELAXED_DINNER_LUNCH_DIFF_PCT  = 0.60   # |dinner - lunch| / smaller <= 60 %
-RELAXED_SERVING_BALANCE_RATIO  = 4.0
+
+# Intra-meal balance for any subrecipe PAIR that has no explicit rule in
+# recipe_subrecipe_rule: no subrecipe may exceed this ratio × any other
+# subrecipe in the same meal. Prevents "3 Greek yogurts / ½ granola" style
+# domination by default. A pair WITH an explicit rule uses that rule instead
+# of this flat ratio — see `get_recipe_rules` / `_resolve_rules_for_day`.
+DEFAULT_SERVING_BALANCE_RATIO  = 2.5
 
 
 # =============================================================================
@@ -103,6 +109,58 @@ def get_recipe_subrecipes(recipe_id: int) -> List[Dict[str, Any]]:
         })
 
     return subrecipes
+
+
+def get_recipe_rules(recipe_id: int) -> List[Dict[str, Any]]:
+    """Return subrecipe scaling rules defined for a recipe (recipe_subrecipe_rule table).
+
+    Each rule is keyed by subrecipe_id (not yet resolved to a flattened
+    all_subs index — the caller must do that per-meal, since the same
+    recipe/rule can appear in more than one meal in a single day).
+
+    A recipe with no rules defined here falls back to the flat
+    DEFAULT_SERVING_BALANCE_RATIO for every subrecipe pair in that meal —
+    rules are an opt-in override, never a hard dependency for solving.
+    Fails open (returns no rules) on any lookup error rather than crashing
+    the whole solver.
+    """
+    try:
+        resp = (
+            supabase.table("recipe_subrecipe_rule")
+            .select("subrecipe_a_id, subrecipe_b_id, rule_type, ratio, fixed_servings")
+            .eq("recipe_id", recipe_id)
+            .execute()
+        )
+        return resp.data or []
+    except Exception:
+        return []
+
+
+def _resolve_rules_for_day(
+    all_subs: List[Dict], recipes_by_meal: Dict[str, Dict]
+) -> List[Dict[str, Any]]:
+    """Fetch + resolve recipe_subrecipe_rule entries to all_subs indices for
+    every meal in the day. One rule fetch per distinct recipe_id, done once
+    up front so every LP attempt / fallback call reuses the same resolved list."""
+    id_to_idx: Dict[Tuple[str, Any], int] = {
+        (s["meal"], s["subrecipe_id"]): i for i, s in enumerate(all_subs)
+    }
+
+    resolved: List[Dict[str, Any]] = []
+    for meal_key, info in recipes_by_meal.items():
+        for rule in get_recipe_rules(info["recipe_id"]):
+            a_idx = id_to_idx.get((meal_key, rule["subrecipe_a_id"]))
+            if a_idx is None:
+                continue
+            b_idx = id_to_idx.get((meal_key, rule["subrecipe_b_id"])) if rule.get("subrecipe_b_id") is not None else None
+            resolved.append({
+                "a_idx": a_idx,
+                "b_idx": b_idx,
+                "rule_type": rule["rule_type"],
+                "ratio": float(rule["ratio"]) if rule.get("ratio") is not None else None,
+                "fixed_servings": float(rule["fixed_servings"]) if rule.get("fixed_servings") is not None else None,
+            })
+    return resolved
 
 
 # =============================================================================
@@ -172,21 +230,25 @@ def _safe_fallback(
     F_t: float,
     kcal_t: float,
     allow_under_kcal: bool,
+    resolved_rules: List[Dict[str, Any]] | None = None,
 ) -> Tuple[List[Dict], float | None, Dict]:
     """
     Greedy fallback: start at 1 serving each, then greedily add servings to
     minimise protein deficit first (protein/kcal ratio), then to fill calories.
 
     Every candidate serving bump is checked against the same RELAXED culinary
-    caps the LP's Pass 2 enforces (meal-type kcal share, dinner/lunch balance,
-    intra-meal serving ratio) — see `_respects_balance_caps` below. Without
-    this, a day made of single-subrecipe meals (the LP's hardest case, since
-    each meal is then just "N copies of one fixed-macro block") could hit this
-    fallback and have the greedy kcal-fill phase dump almost the entire day's
-    calories into whichever single recipe has the highest kcal/serving —
-    producing a lopsided plate (e.g. a 1800 kcal lunch next to a 250 kcal
-    dinner) even though the day's macro *totals* look perfectly on target.
+    caps the LP's Pass 2 enforces (meal-type kcal share, dinner/lunch balance)
+    plus this recipe's own subrecipe scaling rules where defined, or the flat
+    DEFAULT_SERVING_BALANCE_RATIO for any pair without one — see
+    `_respects_caps` below. Without this, a day made of single-subrecipe
+    meals (the LP's hardest case, since each meal is then just "N copies of
+    one fixed-macro block") could hit this fallback and have the greedy
+    kcal-fill phase dump almost the entire day's calories into whichever
+    single recipe has the highest kcal/serving — producing a lopsided plate
+    (e.g. a 1800 kcal lunch next to a 250 kcal dinner) even though the day's
+    macro *totals* look perfectly on target.
     """
+    resolved_rules = resolved_rules or []
     servings = {i: 1 for i in range(len(all_subs))}
 
     meal_of:      Dict[int, str] = {i: s["meal"] for i, s in enumerate(all_subs)}
@@ -198,6 +260,27 @@ def _safe_fallback(
     for i, s in enumerate(all_subs):
         meal_indices[s["meal"]].append(i)
 
+    # Pre-set fixed subrecipes and pull them out of the bump candidate pool
+    # entirely — they never move regardless of macro pressure.
+    fixed_indices: set[int] = set()
+    for rule in resolved_rules:
+        if rule["rule_type"] == "fixed":
+            idx = rule["a_idx"]
+            servings[idx] = rule["fixed_servings"]
+            fixed_indices.add(idx)
+
+    # Explicit-rule pairs, both directions, so checking from either side works.
+    rules_by_idx: Dict[int, List[Tuple[int, str, float]]] = defaultdict(list)
+    covered_pairs: set[frozenset] = set()
+    for rule in resolved_rules:
+        if rule["rule_type"] == "fixed" or rule["b_idx"] is None:
+            continue
+        a, b, rt, ratio = rule["a_idx"], rule["b_idx"], rule["rule_type"], rule["ratio"]
+        rules_by_idx[a].append((b, rt, ratio))
+        inverse = {"gte": "lte", "gt": "lt", "lte": "gte", "lt": "gt", "eq": "eq"}[rt]
+        rules_by_idx[b].append((a, inverse, ratio))
+        covered_pairs.add(frozenset((a, b)))
+
     def _kcal_by_meal_type(servs: Dict[int, float]) -> Dict[str, float]:
         out: Dict[str, float] = defaultdict(float)
         for i, s in enumerate(all_subs):
@@ -206,14 +289,38 @@ def _safe_fallback(
                 out[mt] += servs[i] * s["macros"]["kcal"]
         return out
 
+    def _respects_rules(idx: int, trial: Dict[int, float]) -> bool:
+        """Would bumping idx to trial[idx] violate any explicit rule it
+        participates in, or (for any sibling pair with NO explicit rule)
+        the flat DEFAULT_SERVING_BALANCE_RATIO?"""
+        for other, rt, ratio in rules_by_idx[idx]:
+            mine, theirs = trial[idx], trial[other]
+            if rt == "gte" and mine < ratio * theirs:
+                return False
+            if rt == "gt" and mine < ratio * theirs + 1:
+                return False
+            if rt == "lte" and mine > ratio * theirs:
+                return False
+            if rt == "lt" and mine > ratio * theirs - 1:
+                return False
+            if rt == "eq" and mine != theirs:
+                return False
+
+        siblings_no_rule = [
+            trial[j] for j in meal_indices[meal_of[idx]]
+            if j != idx and frozenset((idx, j)) not in covered_pairs
+        ]
+        if siblings_no_rule and trial[idx] > DEFAULT_SERVING_BALANCE_RATIO * min(siblings_no_rule):
+            return False
+        return True
+
     def _respects_balance_caps(idx: int, servs: Dict[int, float]) -> bool:
         """Would bumping idx's serving by one violate the RELAXED meal-type
-        kcal caps or the intra-meal serving-balance ratio?"""
+        kcal caps or this recipe's own subrecipe scaling rules / default ratio?"""
         trial = dict(servs)
         trial[idx] += 1
 
-        siblings = [trial[j] for j in meal_indices[meal_of[idx]] if j != idx]
-        if siblings and trial[idx] > RELAXED_SERVING_BALANCE_RATIO * min(siblings):
+        if not _respects_rules(idx, trial):
             return False
 
         by_type = _kcal_by_meal_type(trial)
@@ -236,7 +343,7 @@ def _safe_fallback(
     def best_protein_per_kcal() -> int | None:
         candidates = [
             i for i in range(len(all_subs))
-            if servings[i] < all_subs[i]["max_serving"] and _respects_balance_caps(i, servings)
+            if i not in fixed_indices and servings[i] < all_subs[i]["max_serving"] and _respects_balance_caps(i, servings)
         ]
         if not candidates:
             return None
@@ -248,7 +355,7 @@ def _safe_fallback(
     def best_kcal() -> int | None:
         candidates = [
             i for i in range(len(all_subs))
-            if servings[i] < all_subs[i]["max_serving"] and _respects_balance_caps(i, servings)
+            if i not in fixed_indices and servings[i] < all_subs[i]["max_serving"] and _respects_balance_caps(i, servings)
         ]
         if not candidates:
             return None
@@ -292,6 +399,8 @@ def _solve_lp_once(
     macro_tol: float,
     allow_under_kcal: bool,
     strict_culinary: bool = True,
+    resolved_rules: List[Dict[str, Any]] | None = None,
+    hard_bounds: bool = True,
 ) -> Tuple[List[Dict], float, Dict] | None:
     """
     Build and solve one LP instance.
@@ -331,7 +440,6 @@ def _solve_lp_once(
         _dl_diff          = STRICT_DINNER_LUNCH_DIFF_PCT
         _no_dinner_lunch  = STRICT_NO_DINNER_YES_LUNCH_PCT
         _no_lunch_dinner  = STRICT_NO_LUNCH_YES_DINNER_PCT
-        _balance_ratio    = STRICT_SERVING_BALANCE_RATIO
         _apply_solo_caps  = True   # solo-meal % caps active in strict mode
     else:
         _breakfast_max    = RELAXED_BREAKFAST_MAX_PCT
@@ -339,7 +447,6 @@ def _solve_lp_once(
         _dl_diff          = RELAXED_DINNER_LUNCH_DIFF_PCT
         _no_dinner_lunch  = None   # dropped in relaxed mode
         _no_lunch_dinner  = None   # dropped in relaxed mode
-        _balance_ratio    = RELAXED_SERVING_BALANCE_RATIO
         _apply_solo_caps  = False
 
     prob = LpProblem(label, LpMinimize)
@@ -413,48 +520,74 @@ def _solve_lp_once(
     )
 
     # ------------------------------------------------------------------
-    # Hard kcal band constraint
+    # Hard kcal / per-macro band constraints — skippable via hard_bounds.
+    # When hard_bounds=False this becomes a BEST-EFFORT pass: no band can
+    # make it infeasible, so it always returns an answer, and the objective
+    # above already weighs all four macros simultaneously, so that answer
+    # is the mathematically closest achievable point to every target at
+    # once — not a single-minded "hit kcal, ignore everything else"
+    # compromise. Used as the step between the tolerance ladder and the
+    # greedy SAFE_FALLBACK so a structurally-infeasible target still gets a
+    # real LP answer instead of the heuristic's uncontrolled macro behaviour.
     # ------------------------------------------------------------------
-    prob += total_K <= (1.0 + tol) * kcal_t
-    if not allow_under_kcal:
-        prob += total_K >= (1.0 - tol) * kcal_t
+    if hard_bounds:
+        prob += total_K <= (1.0 + tol) * kcal_t
+        if not allow_under_kcal:
+            prob += total_K >= (1.0 - tol) * kcal_t
+
+        if P_t > 0:
+            prob += total_P >= (1.0 - macro_tol) * P_t
+            prob += total_P <= (1.0 + macro_tol) * P_t
+        if C_t > 0:
+            prob += total_C >= (1.0 - macro_tol) * C_t
+            prob += total_C <= (1.0 + macro_tol) * C_t
+        if F_t > 0:
+            prob += total_F >= (1.0 - macro_tol) * F_t
+            prob += total_F <= (1.0 + macro_tol) * F_t
 
     # ------------------------------------------------------------------
-    # Hard per-macro band constraints
-    # Unlike kcal, macros are only soft in the objective above, which lets
-    # the solver hit kcal while ignoring individual macros. These hard bounds
-    # force all three macros to land within macro_tol of their targets.
-    # ------------------------------------------------------------------
-    if P_t > 0:
-        prob += total_P >= (1.0 - macro_tol) * P_t
-        prob += total_P <= (1.0 + macro_tol) * P_t
-    if C_t > 0:
-        prob += total_C >= (1.0 - macro_tol) * C_t
-        prob += total_C <= (1.0 + macro_tol) * C_t
-    if F_t > 0:
-        prob += total_F >= (1.0 - macro_tol) * F_t
-        prob += total_F <= (1.0 + macro_tol) * F_t
-
-    # ------------------------------------------------------------------
-    # Intra-meal serving balance constraint
-    # For meals with ≥ 2 subrecipes, no single ingredient may have more
-    # than SERVING_BALANCE_RATIO × any other ingredient's servings.
-    # This prevents one item dominating a meal (e.g. "3 Greek yogurts,
-    # ½ serving granola") while keeping the LP always feasible: both
-    # sides share the same lower bound (≥ 1), so 1 ≤ RATIO × 1 holds.
+    # Intra-meal serving balance / explicit subrecipe rules.
+    # For any subrecipe PAIR that has an explicit rule in
+    # recipe_subrecipe_rule, that rule is used (gt/gte/lte/lt/eq, or a
+    # fixed-servings pin). Any pair with NO explicit rule falls back to the
+    # flat DEFAULT_SERVING_BALANCE_RATIO so it still can't dominate the
+    # meal by default. Both sides share the same lower bound (>= 1), so the
+    # flat-ratio case is always feasible; explicit rules are recipe-author
+    # decisions assumed to be feasible by construction.
     # ------------------------------------------------------------------
     meal_sub_indices: Dict[str, List[int]] = defaultdict(list)
     for _idx, _s in enumerate(all_subs):
         meal_sub_indices[_s["meal"]].append(_idx)
+
+    _covered_pairs: set[frozenset] = set()
+    for _rule in (resolved_rules or []):
+        _a_idx, _rt, _ratio = _rule["a_idx"], _rule["rule_type"], _rule["ratio"]
+        if _rt == "fixed":
+            prob += servings_expr[_a_idx] == _rule["fixed_servings"]
+            continue
+        _b_idx = _rule["b_idx"]
+        if _b_idx is None:
+            continue
+        _covered_pairs.add(frozenset((_a_idx, _b_idx)))
+        if _rt == "gte":
+            prob += servings_expr[_a_idx] >= _ratio * servings_expr[_b_idx]
+        elif _rt == "lte":
+            prob += servings_expr[_a_idx] <= _ratio * servings_expr[_b_idx]
+        elif _rt == "gt":
+            prob += servings_expr[_a_idx] >= _ratio * servings_expr[_b_idx] + serving_step
+        elif _rt == "lt":
+            prob += servings_expr[_a_idx] <= _ratio * servings_expr[_b_idx] - serving_step
+        elif _rt == "eq":
+            prob += servings_expr[_a_idx] == servings_expr[_b_idx]
 
     for _indices in meal_sub_indices.values():
         if len(_indices) < 2:
             continue
         for _a in _indices:
             for _b in _indices:
-                if _a == _b:
+                if _a == _b or frozenset((_a, _b)) in _covered_pairs:
                     continue
-                prob += servings_expr[_a] <= _balance_ratio * servings_expr[_b]
+                prob += servings_expr[_a] <= DEFAULT_SERVING_BALANCE_RATIO * servings_expr[_b]
 
     # ------------------------------------------------------------------
     # Meal-type kcal distribution constraints
@@ -544,7 +677,7 @@ def _solve_lp_once(
         "carbs":             int(round(value(total_C))),
         "fat":               int(round(value(total_F))),
         "kcal":              int(round(value(total_K))),
-        "tolerance_used":    tol,
+        "tolerance_used":    tol if hard_bounds else "BEST_EFFORT_LP",
         "serving_step_used": serving_step,
         "culinary_pass":     "strict" if strict_culinary else "relaxed",
     }
@@ -648,10 +781,14 @@ def optimize_subrecipes(
             for s in all_subs:
                 s["max_serving"] = math.ceil(s["max_serving"] * scale)
 
+    # Resolve any per-recipe subrecipe rules once, up front, for every meal
+    # in the day — reused by every LP attempt and by the greedy fallback.
+    resolved_rules = _resolve_rules_for_day(all_subs, recipes_by_meal)
+
     # Guard: if all targets are zero we have nothing to optimise.
     if kcal_t <= 0:
         return _safe_fallback(
-            all_subs, recipes_by_meal, P_t, C_t, F_t, kcal_t, allow_under_kcal
+            all_subs, recipes_by_meal, P_t, C_t, F_t, kcal_t, allow_under_kcal, resolved_rules
         )
 
     # ------------------------------------------------------------------
@@ -666,7 +803,16 @@ def optimize_subrecipes(
     #      Macro hard-bands (kcal ± tol, protein/carbs/fat ± macro_tol) are
     #      IDENTICAL in both passes — nutritional accuracy is never traded.
     #
-    #    Pass 3 — greedy fallback (last resort).
+    #    Pass 3 — BEST_EFFORT_LP: same LP, same objective, but the hard
+    #      kcal/macro bands are dropped so it is always solvable. This is
+    #      what a structurally-infeasible target (diet/recipe-pool
+    #      mismatch, etc.) falls into — a real, all-four-macros-considered
+    #      LP answer instead of jumping straight to the greedy heuristic.
+    #
+    #    Pass 4 — greedy fallback (absolute last resort; should be
+    #      practically unreachable, since Pass 3 has no hard bounds to
+    #      violate and the remaining constraints — serving balance/rules,
+    #      meal-type distribution — are satisfiable at minimum servings).
     # ------------------------------------------------------------------
     for strict_culinary in (True, False):
         for tol, macro_tol in zip(KCAL_TOLERANCES, MACRO_TOLERANCES):
@@ -683,15 +829,37 @@ def optimize_subrecipes(
                     macro_tol=macro_tol,
                     allow_under_kcal=allow_under_kcal,
                     strict_culinary=strict_culinary,
+                    resolved_rules=resolved_rules,
                 )
                 if result is not None:
                     return result
 
+    for strict_culinary in (False, True):
+        for step in (1.0, SERVING_STEP_FINE):
+            result = _solve_lp_once(
+                all_subs=all_subs,
+                recipes_by_meal=recipes_by_meal,
+                P_t=P_t,
+                C_t=C_t,
+                F_t=F_t,
+                kcal_t=kcal_t,
+                serving_step=step,
+                tol=KCAL_TOLERANCES[-1],
+                macro_tol=MACRO_TOLERANCES[-1],
+                allow_under_kcal=allow_under_kcal,
+                strict_culinary=strict_culinary,
+                resolved_rules=resolved_rules,
+                hard_bounds=False,
+            )
+            if result is not None:
+                return result
+
     # ------------------------------------------------------------------
-    # 4. All LP attempts failed — use greedy safe fallback.
+    # 4. Even BEST_EFFORT_LP failed (should be exceedingly rare) —
+    #    greedy safe fallback as the absolute last resort.
     # ------------------------------------------------------------------
     return _safe_fallback(
-        all_subs, recipes_by_meal, P_t, C_t, F_t, kcal_t, allow_under_kcal
+        all_subs, recipes_by_meal, P_t, C_t, F_t, kcal_t, allow_under_kcal, resolved_rules
     )
 
 
