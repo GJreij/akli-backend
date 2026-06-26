@@ -68,7 +68,9 @@ STRICT_NO_LUNCH_YES_DINNER_PCT = 0.60
 # infeasibility.  Solo-meal % caps (NO_DINNER / NO_LUNCH variants) are dropped
 # entirely in this pass — without the paired meal there is no real distribution
 # problem worth enforcing.
-RELAXED_BREAKFAST_MAX_PCT      = 0.50
+# Breakfast is intentionally NOT widened here — 40% is a hard aesthetic
+# ceiling regardless of pass, so it stays equal to STRICT_BREAKFAST_MAX_PCT.
+RELAXED_BREAKFAST_MAX_PCT      = 0.40
 RELAXED_SNACK_MAX_PCT          = 0.35
 RELAXED_DINNER_LUNCH_DIFF_PCT  = 0.60   # |dinner - lunch| / smaller <= 60 %
 
