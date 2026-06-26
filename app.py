@@ -11,6 +11,7 @@ from routes.packaging import packaging_bp
 from routes.client_meals import client_meals_bp
 from routes.price_simulator import simple_price_bp  
 from routes.get_available_recipes import get_available_recipes_bp
+from routes.delivery import delivery_bp
 import os
 
 app = Flask(__name__)
@@ -28,6 +29,7 @@ app.register_blueprint(packaging_bp)
 app.register_blueprint(client_meals_bp)
 app.register_blueprint(simple_price_bp)  # <--- FIX
 app.register_blueprint(get_available_recipes_bp)
+app.register_blueprint(delivery_bp)
 
 @app.route("/")
 def home():

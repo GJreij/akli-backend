@@ -63,7 +63,7 @@ def get_packaging_view(start_date, end_date):
     mpd_ids = [m["id"] for m in mpd]
     mpdr_res = (
         supabase.table("meal_plan_day_recipe")
-        .select("id, meal_plan_day_id, recipe_id, meal_type")
+        .select("id, meal_plan_day_id, recipe_id, meal_type, packaging_status")
         .in_("meal_plan_day_id", mpd_ids)
         .execute()
     )
@@ -166,6 +166,7 @@ def get_packaging_view(start_date, end_date):
                     "meal_plan_day_recipe_id": mpdr_entry["id"],
                     "meal_type": mpdr_entry.get("meal_type"),
                     "recipe_name": recipe_info.get("name") if recipe_info else None,
+                    "packaging_status": mpdr_entry.get("packaging_status") or "pending",
                     "subrecipes": subs
                 })
 
