@@ -1,5 +1,9 @@
 from flask import Blueprint, request, jsonify
-from services.pricing_service import get_kcal_discount, fetch_latest_prices
+from services.pricing_service import (
+    fetch_latest_prices,
+    compute_macro_cost,
+    compute_packaging_cost,
+)
 
 simple_price_bp = Blueprint("simple_price_simulator", __name__)
 
@@ -57,22 +61,28 @@ def simple_price_simulator():
     estimated_kcal = protein_g * 4 + carbs_g * 4 + fat_g * 9
 
     # Macro cost (per day)
-    base_macro_cost = (
-        protein_g * prices["protein_price_per_g"]
-        + carbs_g * prices["carbs_price_per_g"]
-        + fat_g * prices["fat_price_per_g"]
+    macro_result = compute_macro_cost(
+        protein_g=protein_g, carbs_g=carbs_g, fat_g=fat_g,
+        kcal=estimated_kcal,
+        prices=prices,
+        apply_kcal_discount=apply_kcal_discount,
     )
-
-    discount_pct = get_kcal_discount(estimated_kcal) if apply_kcal_discount else 0.0
-    macro_cost_after_discount = base_macro_cost * (1 - discount_pct)
+    base_macro_cost = macro_result["base_macro_cost"]
+    discount_pct = macro_result["discount_pct"]
+    macro_cost_after_discount = macro_result["macro_cost_after_discount"]
 
     # Packaging costs
     day_packaging = prices["day_packaging_price"]
     recipes_packaging = meals_per_day * prices["recipe_packaging_price"]
     subrecipes_packaging = meals_per_day * avg_subrecipes_per_meal * prices["subrecipe_packaging_price"]
+    packaging_cost = compute_packaging_cost(
+        meals_count=meals_per_day,
+        subrecipes_count=meals_per_day * avg_subrecipes_per_meal,
+        prices=prices,
+    )
 
     avg_day_price = round(
-        day_packaging + macro_cost_after_discount + recipes_packaging + subrecipes_packaging,
+        day_packaging + macro_cost_after_discount + packaging_cost,
         2
     )
 

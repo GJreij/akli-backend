@@ -3,6 +3,7 @@ import statistics
 from utils.supabase_client import supabase
 from services.promo_service import validate_and_apply_promo_code
 from services.volume_discount_service import apply_volume_discount
+from services.pricing_service import compute_macro_cost, compute_packaging_cost
 from utils.event_logger import log_event
 
 checkout_bp = Blueprint("checkout", __name__)
@@ -11,20 +12,6 @@ checkout_bp = Blueprint("checkout", __name__)
 # CONFIG
 # -------------------------------
 DELIVERY_DAY_MINIMUM = 25  # if a given day's total < 25, delivery applies for that day
-
-
-def get_kcal_discount(kcal):
-    min_kcal = 1200
-    max_kcal = 3000
-    max_discount = 0.15
-
-    if kcal <= min_kcal:
-        return 0.0
-    if kcal >= max_kcal:
-        return max_discount
-    
-    ratio = (kcal - min_kcal) / (max_kcal - min_kcal)
-    return ratio * max_discount
 
 
 @checkout_bp.route("/checkout_summary", methods=["POST"])
@@ -68,6 +55,16 @@ def checkout_summary():
     recipe_packaging_price = price_data.get("recipe_packaging_price", 0) or 0
     subrecipe_packaging_price = price_data.get("subrecipe_packaging_price", 0) or 0
     delivery_price_per_day = price_data.get("delivery_price", 0) or 0
+
+    # Shared `prices` dict shape expected by pricing_service's compute_* helpers
+    prices = {
+        "protein_price_per_g": protein_price,
+        "carbs_price_per_g": carbs_price,
+        "fat_price_per_g": fat_price,
+        "day_packaging_price": day_packaging_price,
+        "recipe_packaging_price": recipe_packaging_price,
+        "subrecipe_packaging_price": subrecipe_packaging_price,
+    }
 
 
     # ------------------------------------------------------------------
@@ -126,14 +123,20 @@ def checkout_summary():
             f = macros.get("fat", 0) or 0
 
 
-            base_macro_cost = p * protein_price + c * carbs_price + f * fat_price
-            discount_pct = get_kcal_discount(totals.get("kcal", 0))
-            macro_cost = base_macro_cost * (1 - discount_pct)
+            macro_result = compute_macro_cost(
+                protein_g=p, carbs_g=c, fat_g=f,
+                kcal=totals.get("kcal", 0),
+                prices=prices,
+            )
+            macro_cost = macro_result["macro_cost_after_discount"]
 
-            recipe_cost = recipe_packaging_price
-            sub_pack_cost = len(meal.get("subrecipes", [])) * subrecipe_packaging_price
+            packaging_cost = compute_packaging_cost(
+                meals_count=1,
+                subrecipes_count=len(meal.get("subrecipes", [])),
+                prices=prices,
+            )
 
-            day_price += macro_cost + recipe_cost + sub_pack_cost
+            day_price += macro_cost + packaging_cost
 
         total_price += day_price
         daily_price_details.append({
@@ -151,15 +154,14 @@ def checkout_summary():
     # day/recipe/subrecipe containers are a real per-day operational cost
     # regardless of billing granularity.
     # ------------------------------------------------------------------
-    week_base_macro_cost = (
-        week_actual["protein"] * protein_price
-        + week_actual["carbs"] * carbs_price
-        + week_actual["fat"] * fat_price
+    week_macro_result = compute_macro_cost(
+        protein_g=week_actual["protein"],
+        carbs_g=week_actual["carbs"],
+        fat_g=week_actual["fat"],
+        kcal=(week_actual["kcal"] / number_of_days) if number_of_days else 0,
+        prices=prices,
     )
-    week_discount_pct = get_kcal_discount(
-        (week_actual["kcal"] / number_of_days) if number_of_days else 0
-    )
-    week_macro_cost = week_base_macro_cost * (1 - week_discount_pct)
+    week_macro_cost = week_macro_result["macro_cost_after_discount"]
 
     # ------------------------------------------------------------------
     # STEP 2c — Weekly accuracy: actual vs target, as % of goal per macro
@@ -292,12 +294,12 @@ def checkout_summary():
     # per-day, ops-facing) daily_breakdown total — both derive from the
     # same promo/delivery inputs, just a different grams aggregation.
     # ------------------------------------------------------------------
-    weekly_packaging_total = (
-        day_packaging_price * number_of_days
-        + recipe_packaging_price * sum(len(d.get("meals", [])) for d in days)
-        + subrecipe_packaging_price * sum(
+    weekly_packaging_total = day_packaging_price * number_of_days + compute_packaging_cost(
+        meals_count=sum(len(d.get("meals", [])) for d in days),
+        subrecipes_count=sum(
             len(m.get("subrecipes", [])) for d in days for m in d.get("meals", [])
-        )
+        ),
+        prices=prices,
     )
     weekly_price_before_discount = round(week_macro_cost + weekly_packaging_total, 2)
     weekly_price_after_discount = round(weekly_price_before_discount * discount_ratio, 2)

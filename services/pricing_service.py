@@ -55,6 +55,52 @@ def fetch_latest_prices() -> dict:
     }
 
 
+def compute_macro_cost(
+    *,
+    protein_g: float,
+    carbs_g: float,
+    fat_g: float,
+    kcal: float,
+    prices: dict,
+    apply_kcal_discount: bool = True,
+) -> dict:
+    """
+    Single source of truth for the per-gram macro cost formula + kcal discount.
+    Used by checkout, the price simulator, and the UI estimator alike, so the
+    discount curve and per-gram formula can never drift between them.
+    """
+    base_macro_cost = (
+        protein_g * prices["protein_price_per_g"]
+        + carbs_g * prices["carbs_price_per_g"]
+        + fat_g * prices["fat_price_per_g"]
+    )
+
+    discount_pct = get_kcal_discount(kcal) if apply_kcal_discount else 0.0
+    macro_cost_after_discount = base_macro_cost * (1 - discount_pct)
+
+    return {
+        "base_macro_cost": base_macro_cost,
+        "discount_pct": discount_pct,
+        "macro_cost_after_discount": macro_cost_after_discount,
+    }
+
+
+def compute_packaging_cost(
+    *,
+    meals_count: float,
+    subrecipes_count: float,
+    prices: dict,
+) -> float:
+    """
+    Single source of truth for packaging cost: per-meal (recipe) packaging
+    plus per-subrecipe packaging.
+    """
+    return (
+        meals_count * prices["recipe_packaging_price"]
+        + subrecipes_count * prices["subrecipe_packaging_price"]
+    )
+
+
 def estimate_day_price(
     *,
     protein_g: float,
@@ -75,21 +121,29 @@ def estimate_day_price(
     """
     prices = fetch_latest_prices()
 
-    base_macro_cost = (
-        protein_g * prices["protein_price_per_g"]
-        + carbs_g * prices["carbs_price_per_g"]
-        + fat_g * prices["fat_price_per_g"]
+    macro_result = compute_macro_cost(
+        protein_g=protein_g,
+        carbs_g=carbs_g,
+        fat_g=fat_g,
+        kcal=total_kcal,
+        prices=prices,
+        apply_kcal_discount=apply_kcal_discount,
     )
-
-    discount_pct = get_kcal_discount(total_kcal) if apply_kcal_discount else 0.0
-    macro_cost_after_discount = base_macro_cost * (1 - discount_pct)
+    base_macro_cost = macro_result["base_macro_cost"]
+    discount_pct = macro_result["discount_pct"]
+    macro_cost_after_discount = macro_result["macro_cost_after_discount"]
 
     day_packaging = prices["day_packaging_price"]
     recipes_packaging = meals_per_day * prices["recipe_packaging_price"]
     subrecipes_packaging = meals_per_day * avg_subrecipes_per_meal * prices["subrecipe_packaging_price"]
+    packaging_cost = compute_packaging_cost(
+        meals_count=meals_per_day,
+        subrecipes_count=meals_per_day * avg_subrecipes_per_meal,
+        prices=prices,
+    )
 
     estimated_day_price = round(
-        day_packaging + macro_cost_after_discount + recipes_packaging + subrecipes_packaging,
+        day_packaging + macro_cost_after_discount + packaging_cost,
         2
     )
 
