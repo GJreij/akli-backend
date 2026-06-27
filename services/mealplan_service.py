@@ -18,9 +18,44 @@ from utils.supabase_client import supabase
 # "solved"; BEST_EFFORT_LP (see below) takes over instead of stretching
 # the band further.
 KCAL_TOLERANCES  = [0.08, 0.10, 0.15, 0.20]
-# Paired macro tolerance ladder — slightly wider than kcal since individual
-# macros are harder to hit exactly with discrete integer servings.
-MACRO_TOLERANCES = [0.12, 0.15, 0.18, 0.20]
+# Base macro tolerance ladder — these are no longer used directly as the
+# hard-band %. They feed `macro_tolerance()` below, which rescales each one
+# per-macro, per-client, based on how big a kcal-share that macro represents
+# in THIS client's diet. A flat 20% band on a 30g fat target and an 80g fat
+# target are very different things in absolute grams; share-scaling keeps
+# the absolute slack proportionate instead of letting small targets blow up
+# or large targets get an unrealistically wide band.
+BASE_MACRO_TOLERANCES = [0.15, 0.18, 0.22, 0.25]
+
+# kcal-per-gram for each macro, used to convert a gram target into its
+# share of total daily kcal.
+KCAL_PER_G = {"protein": 4.0, "carbs": 4.0, "fat": 9.0}
+
+# A macro at this kcal-share gets exactly BASE_TOL (no rescaling). Below this
+# share it gets a wider %; above it, a tighter %. 0.25 ~ "an even three-way
+# split of P/C/F" as the reference point.
+REFERENCE_KCAL_SHARE = 0.25
+
+# Clamp so the rescaling never degenerates (share -> 0 blowing the tolerance
+# to infinity, or share -> 1 squeezing it to nothing).
+MIN_MACRO_TOLERANCE = 0.10
+MAX_MACRO_TOLERANCE = 0.75
+
+
+def macro_tolerance(macro: str, grams_target: float, kcal_t: float, base_tol: float) -> float:
+    """Share-scaled tolerance for one macro, for one client/day.
+
+    share = this macro's kcal contribution / total daily kcal.
+    A macro that's a small slice of the diet (e.g. fat on a low-fat plan)
+    gets a wider relative band; a macro that dominates the diet (e.g. carbs
+    on a high-carb plan) gets a tighter one — because moving it by the same
+    % moves total kcal much more.
+    """
+    if kcal_t <= 0 or grams_target <= 0:
+        return MAX_MACRO_TOLERANCE
+    share = (grams_target * KCAL_PER_G[macro]) / kcal_t
+    tol = base_tol * (REFERENCE_KCAL_SHARE / max(share, 0.01))
+    return max(MIN_MACRO_TOLERANCE, min(MAX_MACRO_TOLERANCE, tol))
 
 # Half-step granularity tried after integer step fails for each tolerance.
 SERVING_STEP_FINE = 0.5
@@ -283,6 +318,13 @@ def _safe_fallback(
         rules_by_idx[b].append((a, inverse, ratio))
         covered_pairs.add(frozenset((a, b)))
 
+    # Same opt-out semantics as the LP: a meal whose recipe defines ANY
+    # explicit rule no longer gets the flat default applied to its
+    # uncovered pairs at all.
+    meals_with_explicit_rules: set[str] = {
+        all_subs[rule["a_idx"]]["meal"] for rule in resolved_rules
+    }
+
     def _kcal_by_meal_type(servs: Dict[int, float]) -> Dict[str, float]:
         out: Dict[str, float] = defaultdict(float)
         for i, s in enumerate(all_subs):
@@ -307,6 +349,9 @@ def _safe_fallback(
                 return False
             if rt == "eq" and mine != theirs:
                 return False
+
+        if meal_of[idx] in meals_with_explicit_rules:
+            return True
 
         siblings_no_rule = [
             trial[j] for j in meal_indices[meal_of[idx]]
@@ -398,7 +443,7 @@ def _solve_lp_once(
     kcal_t: float,
     serving_step: float,
     tol: float,
-    macro_tol: float,
+    macro_tols: Dict[str, float],
     allow_under_kcal: bool,
     strict_culinary: bool = True,
     resolved_rules: List[Dict[str, Any]] | None = None,
@@ -538,14 +583,14 @@ def _solve_lp_once(
             prob += total_K >= (1.0 - tol) * kcal_t
 
         if P_t > 0:
-            prob += total_P >= (1.0 - macro_tol) * P_t
-            prob += total_P <= (1.0 + macro_tol) * P_t
+            prob += total_P >= (1.0 - macro_tols["protein"]) * P_t
+            prob += total_P <= (1.0 + macro_tols["protein"]) * P_t
         if C_t > 0:
-            prob += total_C >= (1.0 - macro_tol) * C_t
-            prob += total_C <= (1.0 + macro_tol) * C_t
+            prob += total_C >= (1.0 - macro_tols["carbs"]) * C_t
+            prob += total_C <= (1.0 + macro_tols["carbs"]) * C_t
         if F_t > 0:
-            prob += total_F >= (1.0 - macro_tol) * F_t
-            prob += total_F <= (1.0 + macro_tol) * F_t
+            prob += total_F >= (1.0 - macro_tols["fat"]) * F_t
+            prob += total_F <= (1.0 + macro_tols["fat"]) * F_t
 
     # ------------------------------------------------------------------
     # Intra-meal serving balance / explicit subrecipe rules.
@@ -582,8 +627,18 @@ def _solve_lp_once(
         elif _rt == "eq":
             prob += servings_expr[_a_idx] == servings_expr[_b_idx]
 
-    for _indices in meal_sub_indices.values():
-        if len(_indices) < 2:
+    # Recipes that define ANY explicit rule are treated as having opted out
+    # of the flat default entirely — the recipe author has taken deliberate
+    # control of that meal's balance, so uncovered pairs in that meal are
+    # left unconstrained (bounded only by max_serving) rather than silently
+    # falling back to DEFAULT_SERVING_BALANCE_RATIO. Meals with NO rules at
+    # all keep the flat ratio on every pair, same as before.
+    _meals_with_explicit_rules = {
+        all_subs[_rule["a_idx"]]["meal"] for _rule in (resolved_rules or [])
+    }
+
+    for _meal_key, _indices in meal_sub_indices.items():
+        if _meal_key in _meals_with_explicit_rules or len(_indices) < 2:
             continue
         for _a in _indices:
             for _b in _indices:
@@ -817,7 +872,12 @@ def optimize_subrecipes(
     #      meal-type distribution — are satisfiable at minimum servings).
     # ------------------------------------------------------------------
     for strict_culinary in (True, False):
-        for tol, macro_tol in zip(KCAL_TOLERANCES, MACRO_TOLERANCES):
+        for tol, base_macro_tol in zip(KCAL_TOLERANCES, BASE_MACRO_TOLERANCES):
+            macro_tols = {
+                "protein": macro_tolerance("protein", P_t, kcal_t, base_macro_tol),
+                "carbs":   macro_tolerance("carbs",   C_t, kcal_t, base_macro_tol),
+                "fat":     macro_tolerance("fat",      F_t, kcal_t, base_macro_tol),
+            }
             for step in (1.0, SERVING_STEP_FINE):
                 result = _solve_lp_once(
                     all_subs=all_subs,
@@ -828,7 +888,7 @@ def optimize_subrecipes(
                     kcal_t=kcal_t,
                     serving_step=step,
                     tol=tol,
-                    macro_tol=macro_tol,
+                    macro_tols=macro_tols,
                     allow_under_kcal=allow_under_kcal,
                     strict_culinary=strict_culinary,
                     resolved_rules=resolved_rules,
@@ -836,6 +896,11 @@ def optimize_subrecipes(
                 if result is not None:
                     return result
 
+    final_macro_tols = {
+        "protein": macro_tolerance("protein", P_t, kcal_t, BASE_MACRO_TOLERANCES[-1]),
+        "carbs":   macro_tolerance("carbs",   C_t, kcal_t, BASE_MACRO_TOLERANCES[-1]),
+        "fat":     macro_tolerance("fat",      F_t, kcal_t, BASE_MACRO_TOLERANCES[-1]),
+    }
     for strict_culinary in (False, True):
         for step in (1.0, SERVING_STEP_FINE):
             result = _solve_lp_once(
@@ -847,7 +912,7 @@ def optimize_subrecipes(
                 kcal_t=kcal_t,
                 serving_step=step,
                 tol=KCAL_TOLERANCES[-1],
-                macro_tol=MACRO_TOLERANCES[-1],
+                macro_tols=final_macro_tols,
                 allow_under_kcal=allow_under_kcal,
                 strict_culinary=strict_culinary,
                 resolved_rules=resolved_rules,
