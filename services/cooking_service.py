@@ -461,6 +461,16 @@ def get_cooking_overview(start_date, end_date, filters):
                     "instructions": sub["instructions"],
                     "total_servings": total_servings,
                     "selected_meal_plan_day_recipe_serving_id": [s["id"] for s in sub_servings],
+                    # Only the meal_plan_day_recipe ids that actually HAVE a
+                    # serving row for this subrecipe — NOT every mpdr of the
+                    # parent recipe. A recipe's subrecipe composition can vary
+                    # across its own instances (e.g. a rotating side), so
+                    # r["meal_plan_day_recipe_ids"] (all mpdrs for the recipe)
+                    # is the wrong list to hand /portioning/summary for one
+                    # specific subrecipe: it would include mpdrs that were
+                    # never served with this subrecipe, tripping the "Subrecipe
+                    # missing in some MPDRs" guard there.
+                    "meal_plan_day_recipe_ids": sorted({s["meal_plan_day_recipe_id"] for s in sub_servings}),
                     "ingredients_needed": sub_ing_list,
                 }
             )
