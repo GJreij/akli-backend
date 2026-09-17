@@ -1,20 +1,26 @@
 # services/delivery_service.py
 
 from utils.supabase_client import supabase
+from utils.supabase_paging import fetch_all
 
 
 def get_delivery_overview(start_date, end_date):
 
     # --- 1. Deliveries between dates ---
-    deliveries_res = (
+    # Excludes cancelled/cancellation-pending — same rule the cooking and
+    # procurement panels apply. Without this, a client whose day was
+    # modified/cancelled and re-created shows up TWICE on the same date (the
+    # orphaned cancelled row plus the current one) with the same name and
+    # address, which is what made this panel look "wrong".
+    deliveries = fetch_all(lambda lo, hi: (
         supabase.table("deliveries")
         .select("id, delivery_date, delivery_slot_id, user_id, delivery_address, status, meal_plan_day_id")
         .gte("delivery_date", start_date)
         .lte("delivery_date", end_date)
-        .execute()
-    )
+        .not_.in_("status", ["cancellation_pending", "cancelled"])
+        .range(lo, hi)
+    ))
 
-    deliveries = deliveries_res.data or []
     if not deliveries:
         return []
 
