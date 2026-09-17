@@ -12,12 +12,22 @@ def get_delivery_overview(start_date, end_date):
     # modified/cancelled and re-created shows up TWICE on the same date (the
     # orphaned cancelled row plus the current one) with the same name and
     # address, which is what made this panel look "wrong".
+    #
+    # Also excludes meal_plan_day_id IS NULL: order_service._create_deliveries_
+    # and_increment_counts inserts these rows BEFORE _store_meal_plan_bundle
+    # links them a few calls later (not one transaction) — if that later step
+    # throws (timeout, solver error, etc.) the deliveries row is already
+    # committed and stays permanently unlinked: a "pending" delivery with no
+    # meal plan, recipes, or payment behind it at all. Confirmed 3 separate
+    # real occurrences of this in the data as of 2026-09-17. These aren't
+    # real deliveries and must not be shown or counted here.
     deliveries = fetch_all(lambda lo, hi: (
         supabase.table("deliveries")
         .select("id, delivery_date, delivery_slot_id, user_id, delivery_address, status, meal_plan_day_id")
         .gte("delivery_date", start_date)
         .lte("delivery_date", end_date)
         .not_.in_("status", ["cancellation_pending", "cancelled"])
+        .not_.is_("meal_plan_day_id", None)
         .range(lo, hi)
     ))
 
