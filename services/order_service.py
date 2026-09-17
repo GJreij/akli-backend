@@ -120,12 +120,24 @@ class OrderService:
         )
 
         # 8) persist meal plan bundle & get mapping meal_date -> meal_plan_day_id
-        day_to_meal_plan_day_id, meal_plan_record = self._store_meal_plan_bundle(
-            user_id=user_id,
-            meal_plan=meal_plan,
-            deliveries_map=deliveries_map,   # keyed by delivery_date
-            meal_to_delivery=meal_to_delivery,  # meal_date -> delivery_date
-        )
+        #
+        # Steps 7 and 8 are two separate calls, not one transaction — if this
+        # one throws, the deliveries rows (and slot-count bump) from step 7
+        # are already committed. Left alone, that strands a "pending"
+        # delivery with no meal plan, recipes, or payment ever attached
+        # (confirmed 3 real occurrences of exactly that in production data).
+        # Compensate by best-effort undoing step 7, then re-raise so the
+        # route's existing handler still logs and returns the real error.
+        try:
+            day_to_meal_plan_day_id, meal_plan_record = self._store_meal_plan_bundle(
+                user_id=user_id,
+                meal_plan=meal_plan,
+                deliveries_map=deliveries_map,   # keyed by delivery_date
+                meal_to_delivery=meal_to_delivery,  # meal_date -> delivery_date
+            )
+        except Exception:
+            self._rollback_deliveries(deliveries_map, delivery_days, delivery_slot_id)
+            raise
 
         # 9) payment — a wallet top-up amount (new money the client is
         # adding to their wallet, on top of paying for the order) rides on
@@ -432,6 +444,42 @@ class OrderService:
         )
         deliveries_map = {row["delivery_date"]: row["id"] for row in delivery_rows}
         return deliveries_map
+
+    def _rollback_deliveries(self, deliveries_map, delivery_days, delivery_slot_id):
+        """Compensation for a failed _store_meal_plan_bundle: delete the
+        deliveries rows _create_deliveries_and_increment_counts just created
+        and revert the delivery_slots_daily.current_count bump that came with
+        them. Best-effort — this runs from an except block reacting to an
+        already-failed write, so a cleanup failure here is logged rather than
+        raised; the original exception is what the caller needs to see, and
+        is re-raised by the caller right after this returns."""
+        delivery_ids = list(deliveries_map.values())
+        if delivery_ids:
+            try:
+                self.sb.table("deliveries").delete().in_("id", delivery_ids).execute()
+            except Exception as cleanup_err:
+                print(f"[order_service] rollback: failed to delete stranded deliveries {delivery_ids}: {cleanup_err}")
+
+        for day in delivery_days:
+            if day not in deliveries_map:
+                continue  # this day's delivery row was never created — nothing to revert
+            try:
+                row = (
+                    self.sb.table("delivery_slots_daily")
+                    .select("id, current_count")
+                    .eq("delivery_slot_id", delivery_slot_id)
+                    .eq("delivery_date", day)
+                    .limit(1)
+                    .execute()
+                    .data
+                )
+                if row:
+                    new_count = max((row[0].get("current_count") or 0) - 1, 0)
+                    self.sb.table("delivery_slots_daily").update(
+                        {"current_count": new_count}
+                    ).eq("id", row[0]["id"]).execute()
+            except Exception as cleanup_err:
+                print(f"[order_service] rollback: failed to revert slot count for {day}: {cleanup_err}")
 
     def _store_meal_plan_bundle(self, user_id, meal_plan, deliveries_map, meal_to_delivery):
         """
