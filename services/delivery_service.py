@@ -1,7 +1,15 @@
 # services/delivery_service.py
 
+from urllib.parse import quote
+
 from utils.supabase_client import supabase
 from utils.supabase_paging import fetch_all
+
+# frontend/src/components/AddressForm.tsx DEFAULT_MAP_CENTER — the pin the map
+# picker opens on before the client drags it or geolocates. Some clients save
+# without ever moving it, so this exact coordinate in the DB is a placeholder,
+# not a real location, even though it looks like ordinary pin data.
+_DEFAULT_MAP_CENTER = (33.8938, 35.5018)
 
 
 def get_delivery_overview(start_date, end_date):
@@ -58,12 +66,12 @@ def get_delivery_overview(start_date, end_date):
         )
         users_by_id = {u["id"]: u for u in (users_res.data or [])}
 
-    # --- 4. Saved addresses (for lat/lng -> maps link) ---
+    # --- 4. Saved addresses (for label + lat/lng -> maps link) ---
     addresses_by_user = {}
     if user_ids:
         addr_res = (
             supabase.table("user_delivery_address")
-            .select("user_id, address_text, lat, lng, is_default")
+            .select("user_id, label, address_text, lat, lng, is_default")
             .in_("user_id", user_ids)
             .execute()
         )
@@ -83,19 +91,32 @@ def get_delivery_overview(start_date, end_date):
         for p in payments_res.data or []:
             payments_by_mpd[p["meal_plan_day_id"]] = p
 
-    def _maps_link(user_id, address_text):
+    def _matched_address(user_id, address_text):
+        # Only ever match a saved address by this EXACT address text — falling
+        # back to the client's default/first saved address silently pointed
+        # drivers at a different location than the one actually being delivered
+        # to whenever that specific address had no pin of its own (~83% of
+        # deliveries, confirmed 2026-09-22). No match means no pin and no label.
         candidates = addresses_by_user.get(user_id, [])
-        match = None
-        for a in candidates:
-            if (a.get("address_text") or "").strip().lower() == (address_text or "").strip().lower():
-                match = a
-                break
-        if not match:
-            match = next((a for a in candidates if a.get("is_default")), None) or (candidates[0] if candidates else None)
+        return next(
+            (a for a in candidates
+             if (a.get("address_text") or "").strip().lower() == (address_text or "").strip().lower()),
+            None,
+        )
 
-        if match and match.get("lat") is not None and match.get("lng") is not None:
-            return f"https://www.google.com/maps?q={match['lat']},{match['lng']}"
-        return None
+    def _map_info(matched_addr, address_text):
+        lat, lng = (matched_addr or {}).get("lat"), (matched_addr or {}).get("lng")
+        has_pin = lat is not None and lng is not None
+        # A pin sitting exactly on the map picker's untouched default center
+        # means the client saved without ever moving it — not a real location.
+        is_placeholder_pin = has_pin and round(lat, 4) == _DEFAULT_MAP_CENTER[0] and round(lng, 4) == _DEFAULT_MAP_CENTER[1]
+        if has_pin and not is_placeholder_pin:
+            return f"https://www.google.com/maps?q={lat},{lng}", True
+        # No usable pin — fall back to a text search on the address itself
+        # so there's always SOME map action, never a dead end.
+        if address_text:
+            return f"https://www.google.com/maps/search/?api=1&query={quote(address_text)}", False
+        return None, False
 
     # --- 6. Assemble ---
     output = []
@@ -103,6 +124,8 @@ def get_delivery_overview(start_date, end_date):
         user = users_by_id.get(d.get("user_id"))
         slot = slots_by_id.get(d.get("delivery_slot_id"))
         payment = payments_by_mpd.get(d.get("meal_plan_day_id"))
+        matched_addr = _matched_address(d.get("user_id"), d.get("delivery_address"))
+        maps_link, maps_is_precise = _map_info(matched_addr, d.get("delivery_address"))
 
         output.append({
             "id": d["id"],
@@ -120,7 +143,17 @@ def get_delivery_overview(start_date, end_date):
                 "phone_number": user.get("phone_number") if user else None,
             } if user else None,
             "address": d.get("delivery_address"),
-            "maps_link": _maps_link(d.get("user_id"), d.get("delivery_address")),
+            # The client's own free-text label on this saved address (e.g. a
+            # landmark/street note) — shown on their profile but previously
+            # dropped entirely on this panel, even when it held real delivery
+            # detail the formal geocoded address_text didn't capture.
+            "address_label": matched_addr.get("label") if matched_addr else None,
+            "maps_link": maps_link,
+            # False means maps_link is a text-search fallback (no real saved
+            # pin, or the pin was never moved off the map's default center) —
+            # the frontend labels this differently so it's never mistaken for
+            # a precise, verified location.
+            "maps_is_precise": maps_is_precise,
             "payment": {
                 "amount": payment.get("amount"),
                 "currency": payment.get("currency"),
