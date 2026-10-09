@@ -5,8 +5,6 @@ import httpx
 from utils.supabase_client import supabase, SUPABASE_URL, SUPABASE_KEY
 from datetime import datetime, timedelta
 
-DEFAULT_MAX_DELIVERIES = 20
-
 NOTIFY_URL = f"{SUPABASE_URL}/functions/v1/meal-plan-notify"
 NOTIFY_WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "akli_webhook_3f9c2b8d_202")
 
@@ -60,13 +58,8 @@ class OrderService:
             delivery_days.append(delivery_str)
             meal_to_delivery[meal_day_str] = delivery_str
 
-        # 4) capacity checks (bulk) on DELIVERY days + ensure rows exist; also return slot_day_map
-        full_days, slot_day_map = self._check_and_prepare_slot_days(delivery_days, delivery_slot_id)
-        if len(full_days) > 2:
-            return {
-                "error": "Too many selected delivery days are fully booked. Please change your slot.",
-                "full_days": full_days,
-            }, 400
+        # 4) ensure delivery_slots_daily rows exist for DELIVERY days (no capacity limit)
+        slot_day_map = self._prepare_slot_days(delivery_days, delivery_slot_id)
 
         # 5) upsert preference
         self._upsert_user_delivery_preference(user_id, delivery_slot_id)
@@ -243,14 +236,13 @@ class OrderService:
 
     # ---------- HELPERS ----------
 
-    def _check_and_prepare_slot_days(self, delivery_days, delivery_slot_id):
+    def _prepare_slot_days(self, delivery_days, delivery_slot_id):
         """
         Bulk version:
         - Fetch existing delivery_slots_daily rows for all delivery_days.
         - Insert missing rows in one batch.
-        - Return:
-            full_days: list of days where current_count >= max_deliveries
-            slot_day_map: {delivery_date: row}
+        - Return slot_day_map: {delivery_date: row}
+        Deliveries per day are counted but not capped.
         """
         # Fetch existing rows in one query
         res = (
@@ -273,7 +265,6 @@ class OrderService:
                     "delivery_slot_id": delivery_slot_id,
                     "delivery_date": d,
                     "current_count": 0,
-                    "max_deliveries": DEFAULT_MAX_DELIVERIES,
                     "created_at": now,
                 }
                 for d in missing_days
@@ -286,18 +277,7 @@ class OrderService:
             for row in insert_res.data or []:
                 slot_day_map[row["delivery_date"]] = row
 
-        # Now compute full_days using the combined map
-        full_days = []
-        for d in delivery_days:
-            row = slot_day_map.get(d)
-            if not row:
-                continue
-            cur = row.get("current_count") or 0
-            mx = row.get("max_deliveries") or DEFAULT_MAX_DELIVERIES
-            if cur >= mx:
-                full_days.append(d)
-
-        return full_days, slot_day_map
+        return slot_day_map
 
     def _upsert_user_delivery_preference(self, user_id, delivery_slot_id):
         """
@@ -397,9 +377,6 @@ class OrderService:
             if not slot_day:
                 continue
             cur = (slot_day.get("current_count") or 0) + 1
-            mx = slot_day.get("max_deliveries") or DEFAULT_MAX_DELIVERIES
-            if cur > mx:
-                cur = mx  # clamp, though we already checked capacity
             slot_update_payload.append({"id": slot_day["id"], "current_count": cur, "updated_at": now})
         if slot_update_payload:
             self.sb.table("delivery_slots_daily").upsert(slot_update_payload).execute()
@@ -416,7 +393,6 @@ class OrderService:
                         "delivery_slot_id": delivery_slot_id,
                         "delivery_date": day,
                         "current_count": 1,
-                        "max_deliveries": DEFAULT_MAX_DELIVERIES,
                         "created_at": now,
                     }
                 )
