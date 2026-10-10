@@ -71,3 +71,17 @@ class WeeklyMenuService:
             "recipe_ids": recipe_ids,
             "count": len(recipe_ids),
         }, 200
+
+    def menu_recipe_ids_for_date(self, date_str: str, tenant_id=None):
+        """
+        Server-side menu guard for post-checkout swaps/edits. Returns the set
+        of recipe_ids on the weekly menu covering `date_str`, or None when no
+        weekly menu is configured for that date (no restriction — same
+        semantics as the frontend's empty-list fallback).
+        """
+        result, status_code = self.get_available_recipe_ids_for_date(date_str, tenant_id)
+        if status_code != 200:
+            raise ValueError(result.get("error") or "Could not load the menu for this date.")
+        if not result.get("weekly_menu_ids"):
+            return None
+        return set(result.get("recipe_ids") or [])

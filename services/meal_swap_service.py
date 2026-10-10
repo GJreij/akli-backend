@@ -13,6 +13,9 @@ from services.mealplan_service import (
 )
 from services.pricing_service import fetch_latest_prices, compute_macro_cost, compute_packaging_cost
 from services.day_pricing_helpers import day_price_and_macros, sum_macros, wallet_balance as get_wallet_balance
+from services.weekly_menu_service import WeeklyMenuService
+
+weekly_menu_service = WeeklyMenuService()
 
 NON_SWAPPABLE_DAY_STATUSES = ("cancellation_pending", "cancelled")
 MEAL_TYPE_FLAG = {
@@ -88,6 +91,21 @@ class MealSwapService:
         new_recipe = new_recipe_res.data if new_recipe_res else None
         if not new_recipe:
             return ({"error": "Selected recipe not found."}, 404), None
+
+        # Never trust the client's picker for menu availability — it shows an
+        # unfiltered list while the menu is still loading. Swapping back to
+        # the meal's originally-ordered recipe stays allowed.
+        try:
+            menu_ids = weekly_menu_service.menu_recipe_ids_for_date(day["date"])
+        except Exception:
+            logger.exception("Menu lookup failed for swap on %s", day["date"])
+            return ({"error": "Could not check the menu for this date. Please try again."}, 503), None
+        original_id = target.get("original_recipe_id") or target["recipe_id"]
+        if menu_ids is not None and new_recipe_id not in menu_ids and new_recipe_id != original_id:
+            return ({
+                "error": f"\"{new_recipe['name']}\" isn't on the menu for this date.",
+                "reason": "not_on_menu",
+            }, 400), None
 
         flag = MEAL_TYPE_FLAG.get(target["meal_type"])
         if flag and not new_recipe.get(flag):

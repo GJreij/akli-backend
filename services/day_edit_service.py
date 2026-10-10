@@ -15,6 +15,9 @@ from utils.dates import beirut_iso_date
 from services.mealplan_service import optimize_subrecipes
 from services.pricing_service import fetch_latest_prices
 from services.day_pricing_helpers import day_price_and_macros, wallet_balance as get_wallet_balance
+from services.weekly_menu_service import WeeklyMenuService
+
+weekly_menu_service = WeeklyMenuService()
 
 NON_EDITABLE_DAY_STATUSES = ("cancellation_pending", "cancelled")
 MEAL_TYPE_FLAG = {
@@ -109,12 +112,27 @@ class DayEditService:
         )
         recipe_by_id = {r["id"]: r for r in (recipes_res2.data or [])}
 
+        # Same server-side menu guard as Swap. Recipes the day was originally
+        # ordered with stay allowed (e.g. re-adding an excluded meal).
+        try:
+            menu_ids = weekly_menu_service.menu_recipe_ids_for_date(day["date"])
+        except Exception:
+            logger.exception("Menu lookup failed for day edit on %s", day["date"])
+            return ({"error": "Could not check the menu for this date. Please try again."}, 503), None
+        originally_ordered = {r.get("original_recipe_id") or r["recipe_id"] for r in day_recipes}
+
         for change in changes:
             if change.get("action") in ("replace", "add"):
                 meal_type = change.get("meal_type") or by_id.get(change.get("meal_plan_day_recipe_id"), {}).get("meal_type")
                 recipe = recipe_by_id.get(change["new_recipe_id"])
                 if not recipe:
                     return ({"error": "Selected recipe not found."}, 404), None
+                if (menu_ids is not None and recipe["id"] not in menu_ids
+                        and recipe["id"] not in originally_ordered):
+                    return ({
+                        "error": f"\"{recipe['name']}\" isn't on the menu for this date.",
+                        "reason": "not_on_menu",
+                    }, 400), None
                 flag = MEAL_TYPE_FLAG.get(meal_type)
                 if flag and not recipe.get(flag):
                     return ({"error": f"\"{recipe['name']}\" isn't offered for {meal_type}."}, 400), None
