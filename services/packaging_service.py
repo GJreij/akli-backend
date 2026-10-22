@@ -22,7 +22,7 @@ def get_packaging_view(start_date, end_date):
     # --- 1. Deliveries between dates ---
     deliveries_res = (
         supabase.table("deliveries")
-        .select("id, delivery_date, delivery_slot_id, user_id")
+        .select("id, delivery_date, delivery_slot_id, user_id, needs_cutlery")
         .gte("delivery_date", start_date)
         .lte("delivery_date", end_date)
         .execute()
@@ -165,8 +165,14 @@ def get_packaging_view(start_date, end_date):
             packaging_output[d_date][slot_id]["clients"][client_key] = {
                 "name": user.get("name") if user else None,
                 "last_name": user.get("last_name") if user else None,
+                "needs_cutlery": False,
                 "recipes": []
             }
+
+        # A client can only have one delivery per date+slot, but OR it in
+        # case of duplicates so a cutlery request is never hidden.
+        if delivery.get("needs_cutlery"):
+            packaging_output[d_date][slot_id]["clients"][client_key]["needs_cutlery"] = True
 
         for mpd_entry in mpd_entries:
             mpdr_list = mpdr_by_mpd.get(mpd_entry["id"], [])

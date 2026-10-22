@@ -37,6 +37,7 @@ def confirm_order():
         delivery_address_id = payload.get("delivery_address_id")  # id from user_delivery_address
         wallet_amount_requested = payload.get("wallet_amount_requested") or 0
         wallet_topup_amount = payload.get("wallet_topup_amount") or 0
+        needs_cutlery       = payload.get("needs_cutlery") is True  # absent (older clients) -> False
 
         # ---- Input validation ----
         missing = []
@@ -69,6 +70,7 @@ def confirm_order():
             delivery_address_id=delivery_address_id,
             wallet_amount_requested=wallet_amount_requested,
             wallet_topup_amount=wallet_topup_amount,
+            needs_cutlery=needs_cutlery,
         )
 
         if status_code == 200:

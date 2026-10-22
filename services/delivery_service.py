@@ -31,7 +31,7 @@ def get_delivery_overview(start_date, end_date):
     # real deliveries and must not be shown or counted here.
     deliveries = fetch_all(lambda lo, hi: (
         supabase.table("deliveries")
-        .select("id, delivery_date, delivery_slot_id, user_id, delivery_address, status, meal_plan_day_id")
+        .select("id, delivery_date, delivery_slot_id, user_id, delivery_address, status, meal_plan_day_id, needs_cutlery")
         .gte("delivery_date", start_date)
         .lte("delivery_date", end_date)
         .not_.in_("status", ["cancellation_pending", "cancelled"])
@@ -154,6 +154,7 @@ def get_delivery_overview(start_date, end_date):
             # the frontend labels this differently so it's never mistaken for
             # a precise, verified location.
             "maps_is_precise": maps_is_precise,
+            "needs_cutlery": bool(d.get("needs_cutlery")),
             "payment": {
                 "amount": payment.get("amount"),
                 "currency": payment.get("currency"),

@@ -15,7 +15,7 @@ class OrderService:
 
     # ---------- PUBLIC ORCHESTRATOR ----------
 
-    def confirm_order(self, user_id, meal_plan, checkout_summary, delivery_slot_id, payment_method=None, delivery_address=None, delivery_address_id=None, wallet_amount_requested=0, wallet_topup_amount=0):
+    def confirm_order(self, user_id, meal_plan, checkout_summary, delivery_slot_id, payment_method=None, delivery_address=None, delivery_address_id=None, wallet_amount_requested=0, wallet_topup_amount=0, needs_cutlery=False):
         """
         Flow:
           1) Extract ordered meal days from meal_plan
@@ -62,7 +62,7 @@ class OrderService:
         slot_day_map = self._prepare_slot_days(delivery_days, delivery_slot_id)
 
         # 5) upsert preference
-        self._upsert_user_delivery_preference(user_id, delivery_slot_id)
+        self._upsert_user_delivery_preference(user_id, delivery_slot_id, needs_cutlery)
 
         # 6) resolve delivery address (required) + partner
         resolved_address = self._resolve_delivery_address(user_id, delivery_address_id, delivery_address)
@@ -109,6 +109,7 @@ class OrderService:
             delivery_days=delivery_days,
             delivery_slot_id=delivery_slot_id,
             delivery_address=resolved_address,
+            needs_cutlery=needs_cutlery,
             slot_day_map=slot_day_map,
         )
 
@@ -279,14 +280,16 @@ class OrderService:
 
         return slot_day_map
 
-    def _upsert_user_delivery_preference(self, user_id, delivery_slot_id):
+    def _upsert_user_delivery_preference(self, user_id, delivery_slot_id, needs_cutlery=False):
         """
         Keep safe logic: select then update/insert.
         This is called rarely, so performance impact is small.
+        needs_cutlery is remembered here so the next checkout's toggle starts
+        from the client's last choice.
         """
         res = (
             self.sb.table("user_delivery_preference")
-            .select("id, delivery_slot_id")
+            .select("id, delivery_slot_id, needs_cutlery")
             .eq("user_id", user_id)
             .execute()
         )
@@ -295,10 +298,11 @@ class OrderService:
 
         if res.data:
             pref = res.data[0]
-            if pref.get("delivery_slot_id") != delivery_slot_id:
+            if pref.get("delivery_slot_id") != delivery_slot_id or bool(pref.get("needs_cutlery")) != needs_cutlery:
                 self.sb.table("user_delivery_preference").update(
                     {
                         "delivery_slot_id": delivery_slot_id,
+                        "needs_cutlery": needs_cutlery,
                         "updated_at": now,
                     }
                 ).eq("id", pref["id"]).execute()
@@ -307,6 +311,7 @@ class OrderService:
                 {
                     "user_id": user_id,
                     "delivery_slot_id": delivery_slot_id,
+                    "needs_cutlery": needs_cutlery,
                     "created_at": now,
                 }
             ).execute()
@@ -355,6 +360,7 @@ class OrderService:
         delivery_slot_id,
         delivery_address,
         slot_day_map,
+        needs_cutlery=False,
     ):
         """
         Batched version of the above: one bulk upsert for existing
@@ -408,6 +414,7 @@ class OrderService:
                 "delivery_date": day,
                 "delivery_slot_id": delivery_slot_id,
                 "delivery_address": delivery_address,
+                "needs_cutlery": needs_cutlery,
                 "status": "pending",
                 "created_at": now,
             }
