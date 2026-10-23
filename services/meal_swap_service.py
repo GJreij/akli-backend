@@ -12,7 +12,10 @@ from services.mealplan_service import (
     SWAP_MAX_MOVEMENT_PCT,
 )
 from services.pricing_service import fetch_latest_prices, compute_macro_cost, compute_packaging_cost, single_meal_fee
-from services.day_pricing_helpers import day_price_and_macros, sum_macros, wallet_balance as get_wallet_balance
+from services.day_pricing_helpers import (
+    day_price_and_macros, sum_macros, wallet_balance as get_wallet_balance,
+    paid_share, charged_delta, list_price_budget,
+)
 from services.weekly_menu_service import WeeklyMenuService
 
 weekly_menu_service = WeeklyMenuService()
@@ -272,7 +275,9 @@ class MealSwapService:
             + prices.get("swap_fee_price", 0.0), 2
         )
 
-        price_delta = round(after_price - before_price, 2)
+        # List-price difference scaled to what the client actually paid for
+        # this day (see day_pricing_helpers.paid_share).
+        price_delta = charged_delta(after_price - before_price, ctx["paid_share"])
         eligible = price_delta <= wallet_balance
         required_topup = None if eligible else round(price_delta - wallet_balance, 2)
         wallet_after = round(wallet_balance - price_delta, 2)
@@ -318,7 +323,7 @@ class MealSwapService:
             # this option isn't available at all for this swap (rare).
             return None, None
 
-        floor_delta = round(floor_totals["price"] - before_price, 2)
+        floor_delta = charged_delta(floor_totals["price"] - before_price, ctx["paid_share"])
         eligible = True
         reason = None
         required_topup = None
@@ -326,7 +331,9 @@ class MealSwapService:
         if floor_delta <= wallet_balance:
             optimized_subs, day_totals = floor_subs, floor_totals
         else:
-            price_ceiling = round(before_price + wallet_balance, 2)
+            # The LP caps LIST price, so convert the wallet into the list-price
+            # increase it covers at this day's paid share.
+            price_ceiling = round(before_price + list_price_budget(wallet_balance, ctx["paid_share"]), 2)
             capped_subs, capped_totals = self._run_swap_solve(
                 ctx["day_recipes"], meal_plan_day_recipe_id, new_recipe_id, ctx["macro_target"], prices,
                 price_ceiling, reference_servings=reference_servings,
@@ -339,7 +346,7 @@ class MealSwapService:
                 reason = "insufficient_wallet"
                 required_topup = round(floor_delta - wallet_balance, 2)
 
-        price_delta = round(day_totals["price"] - before_price, 2)
+        price_delta = charged_delta(day_totals["price"] - before_price, ctx["paid_share"])
         wallet_after = round(wallet_balance - price_delta, 2)
         _after_rows, after_meal_macros = self._meal_snapshot(optimized_subs, meal_plan_day_recipe_id)
 
@@ -379,6 +386,7 @@ class MealSwapService:
             ctx["serving_rows"], meal_plan_day_recipe_id, ctx["day_recipes"], ctx["macro_target"], prices
         )
         wallet_balance = get_wallet_balance(self.sb, user_id)
+        ctx["paid_share"] = paid_share(self.sb, ctx["day"]["id"])
 
         meal_only_response, meal_only_confirm = self._meal_only_option(
             ctx, meal_plan_day_recipe_id, new_recipe_id, prices,

@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 from utils.dates import beirut_iso_date
 from services.mealplan_service import optimize_subrecipes
 from services.pricing_service import fetch_latest_prices
-from services.day_pricing_helpers import day_price_and_macros, wallet_balance as get_wallet_balance
+from services.day_pricing_helpers import day_price_and_macros, wallet_balance as get_wallet_balance, paid_share, charged_delta
 from services.weekly_menu_service import WeeklyMenuService
 
 weekly_menu_service = WeeklyMenuService()
@@ -297,7 +297,10 @@ class DayEditService:
             return {"error": "Couldn't find a valid configuration for this edit."}, 409, None
 
         wallet_balance = get_wallet_balance(self.sb, user_id)
-        price_delta = round(day_totals["price"] - before_price, 2)
+        # List-price difference scaled to what the client actually paid for
+        # this day (see day_pricing_helpers.paid_share) — a discounted day
+        # must not refund or charge at full price.
+        price_delta = charged_delta(day_totals["price"] - before_price, paid_share(self.sb, ctx["day"]["id"]))
         wallet_after = round(wallet_balance - price_delta, 2)
 
         eligible = price_delta <= wallet_balance
