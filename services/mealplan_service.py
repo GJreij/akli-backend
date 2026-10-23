@@ -664,7 +664,7 @@ def _solve_lp_once(
     # solved kcal and can't go into an LP directly.
     total_price = None
     if prices is not None:
-        discount_pct = get_kcal_discount(kcal_t)
+        discount_pct = get_kcal_discount(kcal_t, prices)
         total_price = (
             prices["day_packaging_price"]
             + (1 - discount_pct) * (

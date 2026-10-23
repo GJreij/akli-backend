@@ -3,7 +3,7 @@ import statistics
 from utils.supabase_client import supabase
 from services.promo_service import validate_and_apply_promo_code
 from services.volume_discount_service import apply_volume_discount
-from services.pricing_service import compute_macro_cost, compute_packaging_cost, resolve_delivery_fee_per_day, single_meal_fee
+from services.pricing_service import compute_macro_cost, compute_packaging_cost, resolve_delivery_fee_per_day, single_meal_fee, kcal_discount_settings
 from utils.event_logger import log_event
 
 checkout_bp = Blueprint("checkout", __name__)
@@ -89,6 +89,7 @@ def checkout_summary():
         "recipe_packaging_price": recipe_packaging_price,
         "subrecipe_packaging_price": subrecipe_packaging_price,
         "single_meal_fee": float(price_data.get("single_meal_fee") or 0),
+        **kcal_discount_settings(price_data),
     }
     single_meal_fee_days = 0
     single_meal_fee_total = 0.0
@@ -298,8 +299,15 @@ def checkout_summary():
         # original day total (pre-promo) — you already stored it above
         original_total = day["original_total_price"]
 
-        # ✅ eligibility based on PRE-discount total
-        needs_delivery = original_total < DELIVERY_DAY_MINIMUM and not waives_delivery
+        # ✅ eligibility based on PRE-discount total — except for an address
+        # with an admin-set delivery_fee_override: that fee is exact and
+        # charged EVERY day, never waived by the $25 free-delivery rule
+        # (otherwise any normal-sized day silently dropped it to free). A
+        # promo that waives delivery still wins, and an override of $0 is
+        # simply free.
+        needs_delivery = not waives_delivery and (
+            delivery_fee_is_override or original_total < DELIVERY_DAY_MINIMUM
+        )
         day_delivery_fee = delivery_price_per_day if needs_delivery else 0
 
         if needs_delivery:
@@ -431,7 +439,9 @@ def checkout_summary():
 
             "delivery": {
                 "fee_per_day": delivery_price_per_day,
-                "minimum_per_day_for_free_delivery": DELIVERY_DAY_MINIMUM,
+                # None when this address's override applies every day —
+                # there is no free-delivery threshold for it.
+                "minimum_per_day_for_free_delivery": None if delivery_fee_is_override else DELIVERY_DAY_MINIMUM,
                 "delivery_days": delivery_days,
                 "delivery_fee": round(delivery_fee, 2),
                 "is_free_delivery": delivery_fee == 0,

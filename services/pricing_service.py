@@ -10,23 +10,41 @@ DEFAULT_AVG_SUBRECIPES_PER_MEAL = 3
 DEFAULT_APPLY_KCAL_DISCOUNT = True
 
 
-def get_kcal_discount(kcal: float) -> float:
-    """
-    Discount grows linearly from 0% at 1200kcal to 22% at 3000kcal.
-    """
-    min_kcal = 1200
-    max_kcal = 3000
-    max_discount = 0.22
+# Kcal discount defaults — only used when a prices dict doesn't carry the
+# macro_price settings (e.g. old callers/tests). Live values come from
+# macro_price.kcal_discount_start_kcal / _end_kcal / _max_pct.
+DEFAULT_KCAL_DISCOUNT_START = 1200
+DEFAULT_KCAL_DISCOUNT_END = 3000
+DEFAULT_KCAL_DISCOUNT_MAX_PCT = 22
 
-    if kcal is None:
+
+def _setting(prices, key, default):
+    value = (prices or {}).get(key)
+    return float(default if value is None else value)
+
+
+def get_kcal_discount(kcal: float, prices: dict | None = None) -> float:
+    """
+    Discount on the macro cost: 0% at or below the start kcal, growing in a
+    straight line to max % at the end kcal, and staying at max % above it.
+    All three come from macro_price (see fetch_latest_prices); defaults are
+    1200 kcal -> 3000 kcal, up to 22%.
+    """
+    start = _setting(prices, "kcal_discount_start_kcal", DEFAULT_KCAL_DISCOUNT_START)
+    end = _setting(prices, "kcal_discount_end_kcal", DEFAULT_KCAL_DISCOUNT_END)
+    max_discount = max(0.0, min(_setting(prices, "kcal_discount_max_pct", DEFAULT_KCAL_DISCOUNT_MAX_PCT), 100.0)) / 100
+
+    if kcal is None or max_discount == 0:
         return 0.0
 
-    if kcal <= min_kcal:
+    if kcal <= start:
         return 0.0
-    if kcal >= max_kcal:
+    # end <= start (a misconfigured row) behaves as a step at start rather
+    # than dividing by zero.
+    if kcal >= end or end <= start:
         return max_discount
 
-    ratio = (kcal - min_kcal) / (max_kcal - min_kcal)
+    ratio = (kcal - start) / (end - start)
     return ratio * max_discount
 
 
@@ -56,6 +74,17 @@ def fetch_latest_prices() -> dict:
         "swap_fee_price": float(price_data.get("swap_fee_price", 0) or 0),
         "edit_fee_price": float(price_data.get("edit_fee_price", 0) or 0),
         "single_meal_fee": float(price_data.get("single_meal_fee", 0) or 0),
+        **kcal_discount_settings(price_data),
+    }
+
+
+def kcal_discount_settings(price_data: dict) -> dict:
+    """The kcal-discount columns of a macro_price row, ready to merge into a
+    prices dict (missing/null columns fall back to the defaults)."""
+    return {
+        "kcal_discount_start_kcal": _setting(price_data, "kcal_discount_start_kcal", DEFAULT_KCAL_DISCOUNT_START),
+        "kcal_discount_end_kcal": _setting(price_data, "kcal_discount_end_kcal", DEFAULT_KCAL_DISCOUNT_END),
+        "kcal_discount_max_pct": _setting(price_data, "kcal_discount_max_pct", DEFAULT_KCAL_DISCOUNT_MAX_PCT),
     }
 
 
@@ -109,7 +138,7 @@ def compute_macro_cost(
         + fat_g * prices["fat_price_per_g"]
     )
 
-    discount_pct = get_kcal_discount(kcal) if apply_kcal_discount else 0.0
+    discount_pct = get_kcal_discount(kcal, prices) if apply_kcal_discount else 0.0
     macro_cost_after_discount = base_macro_cost * (1 - discount_pct)
 
     return {
