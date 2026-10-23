@@ -271,7 +271,8 @@ class ComputeDiscountCorrectionTests(unittest.TestCase):
         ):
             correction = svc._compute_discount_correction(meal_plan_id=251, excluded_day_ids=set())
 
-        self.assertEqual(correction, {"remaining_count": 2, "amount": 5.0})
+        self.assertEqual(correction["remaining_count"], 2)
+        self.assertEqual(correction["amount"], 5.0)
 
     def test_old_orders_without_the_volume_split_are_skipped_not_guessed(self):
         # Orders placed before volume_discount_amount/promo_discount_amount

@@ -266,7 +266,7 @@ class CancellationService:
             self.sb.table("meal_plan_day")
             .select(
                 "id, status, "
-                "payment(amount, original_amount, discount_amount, "
+                "payment(id, amount, original_amount, discount_amount, "
                 "volume_discount_amount, promo_discount_amount, delivery_fee_amount)"
             )
             .eq("meal_plan_id", meal_plan_id)
@@ -304,7 +304,48 @@ class CancellationService:
         if abs(correction) < tolerance:
             return None
 
-        return {"remaining_count": remaining_count, "amount": correction}
+        # The new volume discount, spread back over the remaining days by
+        # their share of the list price (same split order_service uses at
+        # checkout). Applied to the payment rows once the wallet correction
+        # succeeds, so the rows keep describing what the client now really
+        # pays — see _rebase_remaining_payments.
+        new_volume_by_payment = {
+            p["id"]: (round(new_discount * float(p["original_amount"]) / remaining_original_total, 2)
+                      if remaining_original_total > 0 else 0.0)
+            for p in remaining_payments if p.get("id") is not None
+        }
+
+        return {
+            "remaining_count": remaining_count,
+            "amount": correction,
+            "new_volume_by_payment": new_volume_by_payment,
+            "remaining_payments": remaining_payments,
+        }
+
+    def _rebase_remaining_payments(self, computed):
+        """
+        After a volume-discount correction has been charged/credited through
+        the wallet, rewrite each remaining day's volume_discount_amount /
+        discount_amount to the NEW discount. Without this the rows still
+        claim the old discount, so:
+          - a second cancellation recomputes from the stale figure and
+            claws the same discount back again (double charge), and
+          - swap/edit pricing (day_pricing_helpers.paid_share) keeps scaling
+            deltas by a discount the client no longer gets.
+        `amount` is deliberately NOT touched: it's what was billed/collected
+        for the day, and the correction itself already lives in the wallet
+        ledger (counted by the Financial page as an adjustment).
+        """
+        for p in computed["remaining_payments"]:
+            pid = p.get("id")
+            if pid is None or pid not in computed["new_volume_by_payment"]:
+                continue
+            new_volume = computed["new_volume_by_payment"][pid]
+            promo = float(p.get("promo_discount_amount") or 0)
+            self.sb.table("payment").update({
+                "volume_discount_amount": new_volume,
+                "discount_amount": round(promo + new_volume, 2),
+            }).eq("id", pid).execute()
 
     # ---------- CLIENT-FACING: preview the discount impact before requesting ----------
 
@@ -393,6 +434,17 @@ class CancellationService:
                 f"automatically ({e}). Handle it manually if needed."
             )
             return {"amount": correction, "note": note, "applied": False}
+
+        try:
+            self._rebase_remaining_payments(computed)
+        except Exception as e:
+            # The money already moved correctly; only the bookkeeping rows
+            # are stale. Log loudly so it can be fixed by hand — a second
+            # cancellation on this order would otherwise double-correct.
+            logger.critical(
+                "Volume discount correction applied but payment rows NOT rebased for meal_plan_id %s: %s",
+                meal_plan_id, e,
+            )
 
         return {"amount": correction, "note": note, "applied": True}
 
