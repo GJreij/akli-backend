@@ -324,7 +324,12 @@ def checkout_summary():
         # commission/discount-correction math reads off the payment row this
         # day becomes; the fee rides in total_price_with_delivery only, same
         # treatment as delivery_fee.
-        _, day_minimum_fee = _apply_minimum_order_fee(discounted_total, minimum_order_price)
+        # Judged on the PRE-discount day price (same as delivery above) and
+        # then discounted like the food: a promo or volume discount must
+        # never be what pushes a day under the minimum, and a 100% promo
+        # code makes the day fully free — no $minimum left over.
+        _, day_minimum_fee = _apply_minimum_order_fee(original_total, minimum_order_price)
+        day_minimum_fee = round(day_minimum_fee * discount_ratio, 2)
         if day_minimum_fee > 0:
             total_minimum_order_fee += day_minimum_fee
             minimum_order_days_affected += 1
