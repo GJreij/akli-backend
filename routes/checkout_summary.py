@@ -3,7 +3,7 @@ import statistics
 from utils.supabase_client import supabase
 from services.promo_service import validate_and_apply_promo_code
 from services.volume_discount_service import apply_volume_discount
-from services.pricing_service import compute_macro_cost, compute_packaging_cost, resolve_delivery_fee_per_day
+from services.pricing_service import compute_macro_cost, compute_packaging_cost, resolve_delivery_fee_per_day, single_meal_fee
 from utils.event_logger import log_event
 
 checkout_bp = Blueprint("checkout", __name__)
@@ -88,7 +88,10 @@ def checkout_summary():
         "day_packaging_price": day_packaging_price,
         "recipe_packaging_price": recipe_packaging_price,
         "subrecipe_packaging_price": subrecipe_packaging_price,
+        "single_meal_fee": float(price_data.get("single_meal_fee") or 0),
     }
+    single_meal_fee_days = 0
+    single_meal_fee_total = 0.0
 
 
     # ------------------------------------------------------------------
@@ -162,11 +165,21 @@ def checkout_summary():
 
             day_price += macro_cost + packaging_cost
 
+        # Part of the day's price like packaging (so discounts and the
+        # per-day delivery/minimum thresholds see it), surfaced separately
+        # in price_breakdown.single_meal_fee for the checkout UI.
+        day_single_fee = single_meal_fee(len(day.get("meals", [])), prices)
+        if day_single_fee > 0:
+            day_price += day_single_fee
+            single_meal_fee_days += 1
+            single_meal_fee_total += day_single_fee
+
         total_price += day_price
         daily_price_details.append({
             "date": day["date"],
             "total_price": round(day_price, 2),
-            "meals": len(day.get("meals", []))
+            "meals": len(day.get("meals", [])),
+            "single_meal_fee": round(day_single_fee, 2),
         })
 
     # ------------------------------------------------------------------
@@ -344,7 +357,7 @@ def checkout_summary():
             len(m.get("subrecipes", [])) for d in days for m in d.get("meals", [])
         ),
         prices=prices,
-    )
+    ) + single_meal_fee_total
     weekly_price_before_discount = round(week_macro_cost + weekly_packaging_total, 2)
     weekly_price_after_discount = round(weekly_price_before_discount * discount_ratio, 2)
     weekly_price_final = round(weekly_price_after_discount + delivery_fee, 2)
@@ -399,6 +412,15 @@ def checkout_summary():
                 "min_order_days": volume_rule["min_order_days"] if volume_rule else None,
             },
             "promo_discount_amount": promo_discount_amount,
+
+            # Already INCLUDED in total_price_before_discount (it's part of
+            # each one-meal day's price) — shown as an "includes" note, not
+            # an extra line to add.
+            "single_meal_fee": {
+                "fee_per_day": prices["single_meal_fee"],
+                "days": single_meal_fee_days,
+                "total": round(single_meal_fee_total, 2),
+            },
 
             "minimum_order": {
                 "threshold": minimum_order_price,

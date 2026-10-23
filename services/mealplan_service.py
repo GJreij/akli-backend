@@ -674,6 +674,7 @@ def _solve_lp_once(
             )
             + len(recipes_by_meal) * prices["recipe_packaging_price"]
             + len(all_subs) * prices["subrecipe_packaging_price"]
+            + (prices.get("single_meal_fee", 0) or 0) * (1 if len(recipes_by_meal) == 1 else 0)
             + flat_fee
         )
 

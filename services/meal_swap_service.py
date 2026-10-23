@@ -11,7 +11,7 @@ from services.mealplan_service import (
     get_recipe_subrecipes,
     SWAP_MAX_MOVEMENT_PCT,
 )
-from services.pricing_service import fetch_latest_prices, compute_macro_cost, compute_packaging_cost
+from services.pricing_service import fetch_latest_prices, compute_macro_cost, compute_packaging_cost, single_meal_fee
 from services.day_pricing_helpers import day_price_and_macros, sum_macros, wallet_balance as get_wallet_balance
 from services.weekly_menu_service import WeeklyMenuService
 
@@ -263,8 +263,12 @@ class MealSwapService:
         packaging_cost = compute_packaging_cost(
             meals_count=len(ctx["day_recipes"]), subrecipes_count=total_subrecipe_count, prices=prices,
         )
+        # A swap never changes the meal count, so the single-meal fee is on
+        # both sides (before_price via day_price_and_macros) and nets out —
+        # but it must be here too, or a one-meal day's swap credits $fee.
         after_price = round(
             prices["day_packaging_price"] + macro_cost["macro_cost_after_discount"] + packaging_cost
+            + single_meal_fee(len(ctx["day_recipes"]), prices)
             + prices.get("swap_fee_price", 0.0), 2
         )
 

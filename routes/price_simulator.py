@@ -3,6 +3,7 @@ from services.pricing_service import (
     fetch_latest_prices,
     compute_macro_cost,
     compute_packaging_cost,
+    single_meal_fee,
 )
 
 simple_price_bp = Blueprint("simple_price_simulator", __name__)
@@ -82,7 +83,8 @@ def simple_price_simulator():
     )
 
     avg_day_price = round(
-        day_packaging + macro_cost_after_discount + packaging_cost,
+        day_packaging + macro_cost_after_discount + packaging_cost
+        + single_meal_fee(meals_per_day, prices),
         2
     )
 

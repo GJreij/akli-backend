@@ -7,7 +7,7 @@
 # price delta measures only the swap/edit's own impact, independent of
 # whatever promo/affiliate discount applied at original checkout.
 
-from services.pricing_service import compute_macro_cost, compute_packaging_cost
+from services.pricing_service import compute_macro_cost, compute_packaging_cost, single_meal_fee
 
 
 def sum_macros(rows):
@@ -46,6 +46,7 @@ def day_price_and_macros(serving_rows, day_recipes, macro_target, prices):
         meals_count=len(day_recipes), subrecipes_count=len(serving_rows), prices=prices,
     )
     day_price = round(
-        prices["day_packaging_price"] + macro_cost["macro_cost_after_discount"] + packaging_cost, 2
+        prices["day_packaging_price"] + macro_cost["macro_cost_after_discount"] + packaging_cost
+        + single_meal_fee(len(day_recipes), prices), 2
     )
     return day_price, day_macros

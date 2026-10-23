@@ -55,6 +55,7 @@ def fetch_latest_prices() -> dict:
         "delivery_price": float(price_data.get("delivery_price", 0) or 0),
         "swap_fee_price": float(price_data.get("swap_fee_price", 0) or 0),
         "edit_fee_price": float(price_data.get("edit_fee_price", 0) or 0),
+        "single_meal_fee": float(price_data.get("single_meal_fee", 0) or 0),
     }
 
 
@@ -134,6 +135,18 @@ def compute_packaging_cost(
     )
 
 
+def single_meal_fee(meals_count: float, prices: dict) -> float:
+    """
+    Extra packaging fee for a day with exactly ONE meal — the per-day bag
+    (and its handling) costs the same whatever the day holds, so a lone meal
+    under-recovers it at the flat per-recipe packaging price. Set by
+    macro_price.single_meal_fee (0 = off). Must be added everywhere a whole
+    DAY is priced (checkout, estimator, simulator, swap/edit repricing, the
+    LP price expression) — never per meal — or prices drift between them.
+    """
+    return float(prices.get("single_meal_fee", 0) or 0) if meals_count == 1 else 0.0
+
+
 def estimate_day_price(
     *,
     protein_g: float,
@@ -175,8 +188,10 @@ def estimate_day_price(
         prices=prices,
     )
 
+    single_fee = single_meal_fee(meals_per_day, prices)
+
     estimated_day_price = round(
-        day_packaging + macro_cost_after_discount + packaging_cost,
+        day_packaging + macro_cost_after_discount + packaging_cost + single_fee,
         2
     )
 
@@ -194,6 +209,7 @@ def estimate_day_price(
             "day_packaging_cost": round(day_packaging, 2),
             "recipes_packaging_cost": round(recipes_packaging, 2),
             "subrecipes_packaging_cost": round(subrecipes_packaging, 2),
+            "single_meal_fee": round(single_fee, 2),
         },
         "prices_used": prices,
     }
