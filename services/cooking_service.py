@@ -90,7 +90,10 @@ def get_cooking_overview(start_date, end_date, filters):
     # =====================================================
     if filters["client_id"] or filters["delivery_slot_id"]:
 
-        deliveries = deliveries_in_range
+        # Only deliveries whose meal_plan_day survived the cancelled filter
+        # above — rebuilding mpd_ids from every delivery in range would bring
+        # cancelled days back as soon as a client/slot filter is applied.
+        deliveries = [d for d in deliveries_in_range if d.get("meal_plan_day_id") in mpd_map]
 
         client_filter = filters["client_id"]
         if client_filter:
