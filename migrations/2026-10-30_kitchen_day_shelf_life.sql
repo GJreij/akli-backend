@@ -179,3 +179,11 @@ update subrecipe set prep_type='cook', fridge_days=0, freezer_days=null where id
 
 -- Keep the old flag in sync for the catalog screens
 update subrecipe set freezable = (freezer_days is not null);
+
+-- ---------------------------------------------------------------
+-- Corrections (2026-10-30, from the kitchen): these are made, not just portioned
+-- ---------------------------------------------------------------
+update subrecipe set prep_type='assemble', skill='helper', fridge_days=2, freezer_days=null where id in (32, 33); -- Turkey, Kashkaval Cheese (sliced for sandwiches)
+update subrecipe set prep_type='assemble', skill='helper', fridge_days=7, freezer_days=null where id = 26;     -- Akli Blossom Honey (mixed)
+update subrecipe set prep_type='cook', fridge_days=1, freezer_days=null, equipment='stove' where id = 107;     -- Popcorn
+update subrecipe set freezable = (freezer_days is not null) where id in (26, 32, 33, 107);
