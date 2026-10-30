@@ -62,7 +62,7 @@ def _batch_use_by(batch, sub):
     return _d(batch["cooked_on"]) + timedelta(days=days or 0)
 
 
-def _scaled_ingredients(sub_ingreds, ingredient_map, servings):
+def _scaled_ingredients(sub_ingreds, ingredient_map, servings, digits=1):
     out = []
     for ing in sub_ingreds:
         ing_def = ingredient_map.get(ing["ingredient_id"])
@@ -73,7 +73,7 @@ def _scaled_ingredients(sub_ingreds, ingredient_map, servings):
             "ingredient_id": ing_def["id"],
             "name": ing_def["name"],
             "unit": ing_def.get("unit"),
-            "quantity": round(qty, 1),
+            "quantity": round(qty, digits),
             "is_staple": bool(ing_def.get("is_staple")),
             "stored_frozen": bool(ing_def.get("stored_frozen")),
         })
@@ -326,6 +326,8 @@ def get_kitchen_day(cook_date_str):
                         "ingredients": _scaled_ingredients(sub_ingreds[sub_id], ingredient_map, freeze_s)}
                        if freeze else None),
             "comments": comments,
+            # For a hand-typed batch size: multiply by any number of servings.
+            "ingredients_per_serving": _scaled_ingredients(sub_ingreds[sub_id], ingredient_map, 1, digits=4),
         })
 
     prep_rank = {"cook": 0, "assemble": 1, "ready": 2}
