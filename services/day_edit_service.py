@@ -78,7 +78,7 @@ class DayEditService:
 
         recipes_res = (
             self.sb.table("meal_plan_day_recipe")
-            .select("id, recipe_id, meal_type, is_swapped, original_recipe_id")
+            .select("id, recipe_id, meal_type, is_swapped, original_recipe_id, side_salad_removed, side_salad_subrecipe_id")
             .eq("meal_plan_day_id", meal_plan_day_id)
             .execute()
         )
@@ -224,6 +224,10 @@ class DayEditService:
             recipes_by_meal[str(r["id"])] = {
                 "recipe_id": replace_map.get(r["id"], r["recipe_id"]),
                 "meal_type": r["meal_type"],
+                # A salad removed / added at order time stays that way;
+                # replacing the dish starts its new salad fresh.
+                "side_salad_removed": bool(r.get("side_salad_removed")) and r["id"] not in replace_map,
+                "side_salad_subrecipe_id": None if r["id"] in replace_map else r.get("side_salad_subrecipe_id"),
             }
 
         for i, c in enumerate(changes):
@@ -292,6 +296,7 @@ class DayEditService:
             allow_under_kcal=len(eating_out_set) > 0,
             prices=prices,
             flat_fee=prices.get("edit_fee_price", 0.0),
+            user_id=user_id,
         )
         if day_totals.get("tolerance_used") == "SAFE_FALLBACK" or day_totals.get("price") is None:
             return {"error": "Couldn't find a valid configuration for this edit."}, 409, None
@@ -432,6 +437,8 @@ class DayEditService:
                     "recipe_id": new_recipe_id,
                     "is_swapped": True,
                     "original_recipe_id": original_recipe_id,
+                    "side_salad_removed": False,
+                    "side_salad_subrecipe_id": None,
                     "updated_at": now,
                 }).eq("id", mpdr_id).execute()
 

@@ -580,6 +580,8 @@ class OrderService:
                         "meal_plan_day_id": mpd_id,
                         "recipe_id": meal["recipe_id"],
                         "meal_type": meal.get("meal_type"),
+                        "side_salad_removed": bool(meal.get("side_salad_removed")),
+                        "side_salad_subrecipe_id": meal.get("side_salad_subrecipe_id"),
                         "cooking_status": "pending",
                         "packaging_status": "pending",
                         "created_at": now,

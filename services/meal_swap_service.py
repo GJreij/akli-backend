@@ -8,7 +8,8 @@ logger = logging.getLogger(__name__)
 from utils.dates import beirut_iso_date
 from services.mealplan_service import (
     optimize_subrecipes_with_swap,
-    get_recipe_subrecipes,
+    get_meal_subrecipes,
+    get_side_salad_prefs,
     SWAP_MAX_MOVEMENT_PCT,
 )
 from services.pricing_service import fetch_latest_prices, compute_macro_cost, compute_packaging_cost, single_meal_fee
@@ -72,7 +73,7 @@ class MealSwapService:
 
         recipes_res = (
             self.sb.table("meal_plan_day_recipe")
-            .select("id, recipe_id, meal_type, is_swapped, original_recipe_id")
+            .select("id, recipe_id, meal_type, is_swapped, original_recipe_id, side_salad_removed, side_salad_subrecipe_id")
             .eq("meal_plan_day_id", meal_plan_day_id)
             .execute()
         )
@@ -155,6 +156,7 @@ class MealSwapService:
         serving_rows = serving_rows_res.data or []
 
         return None, {
+            "user_id": user_id,
             "day": day,
             "day_recipes": day_recipes,
             "target": target,
@@ -200,11 +202,15 @@ class MealSwapService:
             })
         return result
 
-    def _run_swap_solve(self, day_recipes, meal_plan_day_recipe_id, new_recipe_id, macro_target, prices, price_ceiling, reference_servings=None):
+    def _run_swap_solve(self, user_id, day_recipes, meal_plan_day_recipe_id, new_recipe_id, macro_target, prices, price_ceiling, reference_servings=None):
         recipes_by_meal = {
             str(r["id"]): {
                 "recipe_id": new_recipe_id if r["id"] == meal_plan_day_recipe_id else r["recipe_id"],
                 "meal_type": r["meal_type"],
+                # The swapped-in dish starts with its own salad; every other
+                # meal keeps a salad the client removed at order time off.
+                "side_salad_removed": bool(r.get("side_salad_removed")) and r["id"] != meal_plan_day_recipe_id,
+                "side_salad_subrecipe_id": None if r["id"] == meal_plan_day_recipe_id else r.get("side_salad_subrecipe_id"),
             }
             for r in day_recipes
         }
@@ -218,6 +224,7 @@ class MealSwapService:
             flat_fee=prices.get("swap_fee_price", 0.0),
             reference_servings=reference_servings,
             max_movement_pct=SWAP_MAX_MOVEMENT_PCT if reference_servings else None,
+            user_id=user_id,
         )
         # SAFE_FALLBACK doesn't know about locked_meal_key/price_ceiling/the
         # movement bound at all (see mealplan_service.optimize_subrecipes) —
@@ -243,7 +250,7 @@ class MealSwapService:
                            before_price, before_day_macros, before_meal_macros, wallet_balance):
         """Pure arithmetic, no solver: every other meal keeps its exact
         current servings, so this is always computable and never infeasible."""
-        locked_subs = get_recipe_subrecipes(new_recipe_id)
+        locked_subs = get_meal_subrecipes(new_recipe_id, get_side_salad_prefs(ctx["user_id"]))
         after_meal_macros = {
             "protein": sum(s["macros"]["protein"] for s in locked_subs),
             "carbs":   sum(s["macros"]["carbs"] for s in locked_subs),
@@ -315,7 +322,7 @@ class MealSwapService:
         }
 
         floor_subs, floor_totals = self._run_swap_solve(
-            ctx["day_recipes"], meal_plan_day_recipe_id, new_recipe_id, ctx["macro_target"], prices,
+            ctx["user_id"], ctx["day_recipes"], meal_plan_day_recipe_id, new_recipe_id, ctx["macro_target"], prices,
             price_ceiling=None, reference_servings=reference_servings,
         )
         if floor_subs is None:
@@ -335,7 +342,7 @@ class MealSwapService:
             # increase it covers at this day's paid share.
             price_ceiling = round(before_price + list_price_budget(wallet_balance, ctx["paid_share"]), 2)
             capped_subs, capped_totals = self._run_swap_solve(
-                ctx["day_recipes"], meal_plan_day_recipe_id, new_recipe_id, ctx["macro_target"], prices,
+                ctx["user_id"], ctx["day_recipes"], meal_plan_day_recipe_id, new_recipe_id, ctx["macro_target"], prices,
                 price_ceiling, reference_servings=reference_servings,
             )
             if capped_subs is not None:
@@ -489,6 +496,8 @@ class MealSwapService:
                 "recipe_id": new_recipe_id,
                 "is_swapped": True,
                 "original_recipe_id": original_recipe_id,
+                "side_salad_removed": False,
+                "side_salad_subrecipe_id": None,
                 "updated_at": now,
             }).eq("id", meal_plan_day_recipe_id).execute()
 

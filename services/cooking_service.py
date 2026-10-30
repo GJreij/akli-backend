@@ -285,6 +285,31 @@ def get_cooking_overview(start_date, end_date, filters):
     subrecipe_map = {s["id"]: s for s in subrecipes}
 
     # =====================================================
+    # 6.5️⃣ Side salad notes (user_side_salad_preference) — a note on e.g.
+    # Fattoush belongs to that salad, so it's attached to the salad
+    # subrecipe below (and only for clients actually served it), never to
+    # the recipe card or any other salad.
+    # =====================================================
+    salad_ids = [sid for sid, s in subrecipe_map.items() if s.get("is_side_salad")]
+    salad_note_by_pair = {}
+    if salad_ids and user_ids:
+        salad_prefs = (
+            supabase.table("user_side_salad_preference")
+            .select("subrecipe_id, user_id, comment")
+            .in_("subrecipe_id", salad_ids)
+            .in_("user_id", user_ids)
+            .not_.is_("comment", None)
+            .execute()
+            .data
+        ) or []
+        salad_note_by_pair = {
+            (p["subrecipe_id"], p["user_id"]): p["comment"]
+            for p in salad_prefs
+            if (p.get("comment") or "").strip()
+        }
+    mpd_id_by_mpdr = {r["id"]: r["meal_plan_day_id"] for r in mpdr}
+
+    # =====================================================
     # 7️⃣ Subrecipe ingredients
     # =====================================================
     subrec_ingred = (
@@ -456,6 +481,21 @@ def get_cooking_overview(start_date, end_date, filters):
                 key=lambda x: x["name"].lower(),
             )
 
+            salad_notes = []
+            if sub.get("is_side_salad"):
+                served_user_ids = {
+                    user_id_by_mpd.get(mpd_id_by_mpdr.get(s["meal_plan_day_recipe_id"]))
+                    for s in sub_servings
+                }
+                salad_notes = sorted(
+                    [
+                        {"user_id": uid, "name": user_name_map.get(uid, "Unknown"), "comment": salad_note_by_pair[(sub_id, uid)]}
+                        for uid in served_user_ids
+                        if uid and (sub_id, uid) in salad_note_by_pair
+                    ],
+                    key=lambda n: n["name"].lower(),
+                )
+
             subrecipe_list.append(
                 {
                     "subrecipe_id": sub_id,
@@ -475,6 +515,8 @@ def get_cooking_overview(start_date, end_date, filters):
                     # missing in some MPDRs" guard there.
                     "meal_plan_day_recipe_ids": sorted({s["meal_plan_day_recipe_id"] for s in sub_servings}),
                     "ingredients_needed": sub_ing_list,
+                    "is_side_salad": bool(sub.get("is_side_salad")),
+                    "salad_notes": salad_notes,
                 }
             )
 

@@ -9,6 +9,7 @@ from services.mealplan_service import (
     optimize_subrecipes,
     apply_weekly_carryover,
     update_cumulative_deviation,
+    side_salad_options,
 )
 
 
@@ -23,10 +24,13 @@ def consolidate_changes(change_logs: List[Dict[str, Any]]) -> Dict[str, Any]:
       {
         "2025-01-01": {
           "breakfast": {
-            "action": "delete" | "replace",
+            "action": "delete" | "replace" | "add" | "side_salad",
             "old_recipe_id": ...,
             "new_recipe_id": ... (if replace),
-            "include_macros_in_rest": bool
+            "include_macros_in_rest": bool,
+            "removed": bool (if side_salad — remove / add back the meal's side salad),
+            "choice": int | None (if side_salad and the log carries side_salad_subrecipe_id —
+                      the salad the client added to this meal, None = back to their prefs)
           },
           ...
         },
@@ -74,7 +78,14 @@ def consolidate_changes(change_logs: List[Dict[str, Any]]) -> Dict[str, Any]:
             # Take the last log for that meal_key
             last_log = sorted(logs, key=lambda x: x["created_at"])[-1]
 
-            if last_log.get("Delete"):
+            if "side_salad_removed" in last_log:
+                day_actions[meal_key] = {
+                    "action": "side_salad",
+                    "removed": bool(last_log.get("side_salad_removed")),
+                }
+                if "side_salad_subrecipe_id" in last_log:
+                    day_actions[meal_key]["choice"] = last_log.get("side_salad_subrecipe_id")
+            elif last_log.get("Delete"):
                 day_actions[meal_key] = {
                     "action": "delete",
                     "old_recipe_id": last_log.get("old_recipe_id"),
@@ -262,6 +273,14 @@ def apply_changes_and_optimize(
 
             action = change.get("action")
 
+            # --- Remove / add back this meal's side salad ---
+            if action == "side_salad":
+                meal["side_salad_removed"] = change["removed"]
+                if "choice" in change:
+                    meal["side_salad_subrecipe_id"] = change["choice"]
+                updated_meals.append(meal)
+                continue
+
             # --- Replace recipe ---
             if action == "replace":
                 new_recipe_id = change["new_recipe_id"]
@@ -279,6 +298,9 @@ def apply_changes_and_optimize(
                         "photo": new_recipe["photo"],
                         "subrecipes": new_recipe["subrecipes"],
                         "macros": new_recipe["macros"],
+                        # A removal / added salad was for the old dish, not this one.
+                        "side_salad_removed": False,
+                        "side_salad_subrecipe_id": None,
                     }
                 )
                 updated_meals.append(meal)
@@ -324,6 +346,8 @@ def apply_changes_and_optimize(
                     "photo": new_recipe["photo"],
                     "subrecipes": new_recipe["subrecipes"],
                     "macros": new_recipe["macros"],
+                    "side_salad_removed": False,
+                    "side_salad_subrecipe_id": None,
                 }
             )
             added_meal_types_for_day.add(meal_type)
@@ -372,6 +396,8 @@ def apply_changes_and_optimize(
                 "meal_type": m["meal_type"],
                 "recipe_name": m["recipe_name"],
                 "photo": m.get("photo"),
+                "side_salad_removed": bool(m.get("side_salad_removed")),
+                "side_salad_subrecipe_id": m.get("side_salad_subrecipe_id"),
             }
             for m in updated_meals
         }
@@ -380,11 +406,36 @@ def apply_changes_and_optimize(
         if not recipes_by_meal:
             continue
 
-        # 7. Re-optimize macros for this day using the current adjusted target
+        # 7. Re-optimize macros for this day using the current adjusted target.
+        #    A day whose only change is removing / adding back side salads
+        #    pins every other meal to its current servings, so the calories
+        #    land on the plate the salad left (bigger portion there) instead
+        #    of reshuffling the rest of the day. Falls back to a free solve if
+        #    that meal alone can't absorb it.
+        salad_toggled = {k for k, c in day_change.items() if isinstance(c, dict) and c.get("action") == "side_salad"}
+        reference_servings = None
+        if salad_toggled and len(salad_toggled) == len(day_change):
+            reference_servings = {
+                (m["meal_key"], s["subrecipe_id"]): s["servings"]
+                for m in updated_meals
+                if m["meal_key"] not in salad_toggled
+                for s in (m.get("subrecipes") or [])
+            }
+
         optimized_subs, loss, day_totals = optimize_subrecipes(
         recipes_by_meal,
         adjusted_target,
-        allow_under_kcal=(reduce_macros_pct > 0)
+        allow_under_kcal=(reduce_macros_pct > 0),
+        user_id=user_id,
+        reference_servings=reference_servings,
+        max_movement_pct=0.0 if reference_servings else None,
+            )
+        if reference_servings and day_totals.get("tolerance_used") == "SAFE_FALLBACK":
+            optimized_subs, loss, day_totals = optimize_subrecipes(
+                recipes_by_meal,
+                adjusted_target,
+                allow_under_kcal=(reduce_macros_pct > 0),
+                user_id=user_id,
             )
 
         # Same fix as above: measure against the stable base target, not
@@ -414,6 +465,7 @@ def apply_changes_and_optimize(
                         "name": sub["name"],
                         "servings": sub["servings"],
                         "macros": sub["macros"],
+                        "is_side_salad": sub.get("is_side_salad", False),
                     }
                 )
 
@@ -435,6 +487,7 @@ def apply_changes_and_optimize(
                 "kcal": round(total_kcal),
             }
             meal["subrecipes"] = sub_list
+            meal["side_salad_options"] = side_salad_options(meal["recipe_id"])
 
         # 10. Construct the updated day, including the persisted adjusted_target
         #     and the eating-out set (the latter is what's actually replayed

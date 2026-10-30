@@ -3,11 +3,24 @@ import math
 from typing import Dict, Any, List, Tuple
 from collections import defaultdict
 
+from flask import g, has_app_context
 from pulp import (
     LpProblem, LpMinimize, LpVariable, lpSum, LpInteger, LpBinary, value,
     PULP_CBC_CMD, LpStatus
 )
 from utils.supabase_client import supabase
+
+
+def _request_cache(name: str) -> Dict | None:
+    """Per-request memo on flask.g for lookups that can't change within one
+    request (a recipe's composition, the house salad, a client's salad
+    prefs) but would otherwise be re-queried for every day, meal and repair
+    solve — generate already runs close to Heroku's 30s limit. None outside
+    a request (scripts, tests): no caching there."""
+    if not has_app_context():
+        return None
+    caches = g.setdefault("_mealplan_cache", {})
+    return caches.setdefault(name, {})
 from services.pricing_service import get_kcal_discount
 
 
@@ -196,9 +209,13 @@ def get_recipe_subrecipes(recipe_id: int) -> List[Dict[str, Any]]:
     global property of the subrecipe (the same subrecipe can be the main in
     one recipe and a side in another).
     """
+    cache = _request_cache("recipe_subrecipes")
+    if cache is not None and recipe_id in cache:
+        return [dict(s) for s in cache[recipe_id]]
+
     resp = (
         supabase.table("recipe_subrecipe")
-        .select("max_serving, is_main, subrecipe(id, name, max_serving, kcal, protein, carbs, fat)")
+        .select("max_serving, is_main, subrecipe(id, name, max_serving, kcal, protein, carbs, fat, is_side_salad)")
         .eq("recipe_id", recipe_id)
         .execute()
     )
@@ -214,6 +231,7 @@ def get_recipe_subrecipes(recipe_id: int) -> List[Dict[str, Any]]:
             "name":        sub.get("name"),
             "max_serving": resolved_max,
             "is_main":     bool(rs.get("is_main")),
+            "is_side_salad": bool(sub.get("is_side_salad")),
             "macros": {
                 "kcal":    float(sub.get("kcal")    or 0.0),
                 "protein": float(sub.get("protein") or 0.0),
@@ -222,7 +240,156 @@ def get_recipe_subrecipes(recipe_id: int) -> List[Dict[str, Any]]:
             },
         })
 
+    if cache is not None:
+        cache[recipe_id] = subrecipes
+        return [dict(s) for s in subrecipes]
     return subrecipes
+
+
+# =============================================================================
+# SIDE SALADS
+# =============================================================================
+# A recipe's side salad (subrecipe.is_side_salad — at most one per recipe) is
+# resolved per client before every solve, so generate, plan updates, Day Edit
+# and Swap all agree on it:
+#   - removed from this one meal while ordering -> dropped
+#   - client explicitly added a salad to this one meal (the recipe's own or
+#     the house salad — see side_salad_options) -> that one, whatever their
+#     My Tastes say
+#   - the client never wants salad -> dropped
+#   - client dislikes it -> Akli House Salad instead (same max_serving/role
+#     on the recipe), unless they dislike that too -> dropped
+# A dropped salad simply isn't in the LP, so the rest of the meal scales up
+# to cover its macros — same price, bigger portion.
+
+HOUSE_SALAD_NAME = "Akli House Salad"
+
+
+def get_side_salad_prefs(user_id: str | None) -> Dict[str, Any]:
+    """{"never": bool, "disliked": set of subrecipe ids} for one client."""
+    prefs: Dict[str, Any] = {"never": False, "disliked": set()}
+    if not user_id:
+        return prefs
+    cache = _request_cache("side_salad_prefs")
+    if cache is not None and user_id in cache:
+        return cache[user_id]
+
+    user_res = (
+        supabase.table("user")
+        .select("no_side_salad")
+        .eq("id", user_id)
+        .maybe_single()
+        .execute()
+    )
+    prefs["never"] = bool(((user_res.data if user_res else None) or {}).get("no_side_salad"))
+
+    dislike_res = (
+        supabase.table("user_side_salad_preference")
+        .select("subrecipe_id")
+        .eq("user_id", user_id)
+        .eq("dislike", True)
+        .execute()
+    )
+    prefs["disliked"] = {r["subrecipe_id"] for r in (dislike_res.data or [])}
+    if cache is not None:
+        cache[user_id] = prefs
+    return prefs
+
+
+def _get_house_salad() -> Dict[str, Any] | None:
+    cache = _request_cache("house_salad")
+    if cache is not None and "row" in cache:
+        return cache["row"]
+    res = (
+        supabase.table("subrecipe")
+        .select("id, name, kcal, protein, carbs, fat")
+        .eq("name", HOUSE_SALAD_NAME)
+        .eq("is_side_salad", True)
+        .limit(1)
+        .execute()
+    )
+    row = (res.data or [None])[0]
+    house = None if not row else {
+        "id":   row["id"],
+        "name": row["name"],
+        "macros": {k: float(row.get(k) or 0.0) for k in ("kcal", "protein", "carbs", "fat")},
+    }
+    if cache is not None:
+        cache["row"] = house
+    return house
+
+
+def apply_side_salad_rules(
+    subrecipes: List[Dict[str, Any]],
+    side_prefs: Dict[str, Any],
+    removed: bool = False,
+    chosen_id: int | None = None,
+) -> List[Dict[str, Any]]:
+    """Return a recipe's subrecipes (as from get_recipe_subrecipes) with its
+    side salad kept, swapped for the house salad, or dropped — see above."""
+    salad = next((s for s in subrecipes if s.get("is_side_salad")), None)
+    if salad is None:
+        return subrecipes
+
+    rest = [s for s in subrecipes if s is not salad]
+    if removed:
+        return rest
+
+    def as_house():
+        house = _get_house_salad()
+        if house is None:
+            return None
+        return {**salad, "id": house["id"], "name": house["name"], "macros": house["macros"]}
+
+    if chosen_id is not None:
+        if chosen_id == salad["id"]:
+            return subrecipes
+        house_slot = as_house()
+        if house_slot is not None and house_slot["id"] == chosen_id:
+            return rest + [house_slot]
+        # Not a valid choice for this recipe (e.g. the dish was changed) —
+        # fall through to the client's normal rules.
+
+    if side_prefs.get("never"):
+        return rest
+
+    disliked = side_prefs.get("disliked") or set()
+    if salad["id"] not in disliked:
+        return subrecipes
+
+    house_slot = as_house()
+    if house_slot is None or house_slot["id"] in disliked:
+        return rest
+    return rest + [house_slot]
+
+
+def get_meal_subrecipes(
+    recipe_id: int,
+    side_prefs: Dict[str, Any],
+    side_salad_removed: bool = False,
+    side_salad_subrecipe_id: int | None = None,
+) -> List[Dict[str, Any]]:
+    """get_recipe_subrecipes with this client's side salad rules applied."""
+    return apply_side_salad_rules(
+        get_recipe_subrecipes(recipe_id), side_prefs, side_salad_removed, side_salad_subrecipe_id
+    )
+
+
+def side_salad_options(recipe_id: int, cache: Dict[int, List[Dict[str, Any]]] | None = None) -> List[Dict[str, Any]]:
+    """Salads a client can add to this recipe's meal while ordering: its own
+    side salad + the house salad. Empty when the recipe has no side salad."""
+    if cache is not None and recipe_id in cache:
+        return cache[recipe_id]
+    salad = next((s for s in get_recipe_subrecipes(recipe_id) if s.get("is_side_salad")), None)
+    options: List[Dict[str, Any]] = []
+    if salad is not None:
+        options.append({"subrecipe_id": salad["id"], "name": salad["name"]})
+        house = _get_house_salad()
+        if house is not None and house["id"] != salad["id"]:
+            options.append({"subrecipe_id": house["id"], "name": house["name"]})
+    if cache is not None:
+        cache[recipe_id] = options
+    return options
 
 
 # =============================================================================
@@ -261,6 +428,7 @@ def _build_result(
             "meal_name":    meal_key,
             "meal_type":    meal_type,
             "servings":     serv_val,
+            "is_side_salad": bool(s.get("is_side_salad")),
             "macros": {
                 "protein": mps["protein"] * serv_val,
                 "carbs":   mps["carbs"]   * serv_val,
@@ -984,6 +1152,7 @@ def _solve_lp_once(
             "meal_name":    meal_key,
             "meal_type":    meal_type,
             "servings":     serv_val,
+            "is_side_salad": bool(s.get("is_side_salad")),
             "macros": {
                 "protein": mps["protein"] * serv_val,
                 "carbs":   mps["carbs"]   * serv_val,
@@ -1010,6 +1179,7 @@ def optimize_subrecipes(
     flat_fee: float = 0.0,
     reference_servings: Dict[Tuple[str, int], float] | None = None,
     max_movement_pct: float | None = None,
+    user_id: str | None = None,
 ) -> Tuple[List[Dict[str, Any]], float | None, Dict[str, Any]]:
     """
     Given a dict of meals for one day and a daily macro target, determine the
@@ -1017,7 +1187,9 @@ def optimize_subrecipes(
 
     Parameters
     ----------
-    recipes_by_meal : { meal_key: { recipe_id, meal_type, ... } }
+    recipes_by_meal : { meal_key: { recipe_id, meal_type, side_salad_removed?, ... } }
+    user_id         : the client being solved for — drives their side salad
+                      rules (see apply_side_salad_rules). None = recipe as-is.
     macro_target    : { protein_g, carbs_g, fat_g, kcal }
     allow_under_kcal: if True, the solver may go below (1-tol)*kcal without
                       penalty (used when a meal has been deleted/eaten out).
@@ -1049,9 +1221,13 @@ def optimize_subrecipes(
     # ------------------------------------------------------------------
     # 1. Flatten all subrecipes across meals
     # ------------------------------------------------------------------
+    side_prefs = get_side_salad_prefs(user_id)
     all_subs: List[Dict] = []
     for meal_key, info in recipes_by_meal.items():
-        subs = get_recipe_subrecipes(info["recipe_id"])
+        subs = get_meal_subrecipes(
+            info["recipe_id"], side_prefs,
+            bool(info.get("side_salad_removed")), info.get("side_salad_subrecipe_id"),
+        )
         for s in subs:
             max_serving = s.get("max_serving")
             all_subs.append({
@@ -1060,6 +1236,7 @@ def optimize_subrecipes(
                 "name":         s["name"],
                 "macros":       s["macros"],
                 "is_main":      bool(s.get("is_main")),
+                "is_side_salad": bool(s.get("is_side_salad")),
                 "max_serving":  (float(int(max_serving)) if max_serving is not None else None),
             })
 
@@ -1351,6 +1528,7 @@ def optimize_subrecipes_with_swap(
     flat_fee: float = 0.0,
     reference_servings: Dict[Tuple[str, int], float] | None = None,
     max_movement_pct: float | None = None,
+    user_id: str | None = None,
 ) -> Tuple[List[Dict[str, Any]], float | None, Dict[str, Any]]:
     """
     Re-solve a day with one meal swapped to `locked_recipe_id` and locked at
@@ -1364,7 +1542,12 @@ def optimize_subrecipes_with_swap(
     map and forwards it into optimize_subrecipes, it doesn't mutate
     recipes_by_meal itself.
     """
-    locked_subs = get_recipe_subrecipes(locked_recipe_id)
+    locked_subs = get_meal_subrecipes(
+        locked_recipe_id,
+        get_side_salad_prefs(user_id),
+        bool(recipes_by_meal[locked_meal_key].get("side_salad_removed")),
+        recipes_by_meal[locked_meal_key].get("side_salad_subrecipe_id"),
+    )
     locked_subrecipe_servings = {s["id"]: 1.0 for s in locked_subs}
 
     return optimize_subrecipes(
@@ -1378,6 +1561,7 @@ def optimize_subrecipes_with_swap(
         flat_fee=flat_fee,
         reference_servings=reference_servings,
         max_movement_pct=max_movement_pct,
+        user_id=user_id,
     )
 
 

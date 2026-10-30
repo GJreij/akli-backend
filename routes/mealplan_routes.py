@@ -7,6 +7,7 @@ from services.mealplan_service import (
     optimize_subrecipes,
     apply_weekly_carryover,
     update_cumulative_deviation,
+    side_salad_options,
 )
 from services import daily_menu_service as dms
 from utils.event_logger import log_event
@@ -314,6 +315,7 @@ def generate_meal_plan():
     week_used_by_type: dict = defaultdict(set)
     previous_day_recipes: set = set()  # this client's own picks from the immediately preceding day only
     recipe_lookup = recipes_by_id
+    salad_options_cache: dict = {}  # recipe_id -> salads the client may add to it
 
     # Repair escalation cap: a real 10-day request against the hardest
     # test client measured 35.93s/32.45s with both dinner+lunch trials
@@ -383,7 +385,7 @@ def generate_meal_plan():
             day_target = apply_weekly_carryover(target_with_kcal, cumulative_deviation)
 
         optimized_subs, loss, day_totals = optimize_subrecipes(
-            recipes_by_meal, day_target
+            recipes_by_meal, day_target, user_id=user_id
         )
 
         # Single bounded repair step (point 3): at most one extra solve,
@@ -402,6 +404,7 @@ def generate_meal_plan():
             flex_stats=flex_stats,
             recipe_lookup=recipe_lookup,
             trial_meal_types=repair_trial_types,
+            user_id=user_id,
         )
 
         if swapped_meal_key is not None:
@@ -448,6 +451,7 @@ def generate_meal_plan():
                     "name":         sub["name"],
                     "servings":     sub["servings"],
                     "macros":       sub["macros"],
+                    "is_side_salad": sub.get("is_side_salad", False),
                 })
 
         # Compute per-meal macro totals
@@ -470,6 +474,9 @@ def generate_meal_plan():
                 "photo":       info["photo"],
                 "macros":      macros_per_meal.get(meal_key, {}),
                 "subrecipes":  subs_by_meal.get(meal_key, []),
+                "side_salad_removed": False,
+                "side_salad_subrecipe_id": None,
+                "side_salad_options": side_salad_options(info["recipe_id"], salad_options_cache),
             }
             for meal_key, info in recipes_by_meal.items()
         ]
