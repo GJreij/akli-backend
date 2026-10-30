@@ -187,3 +187,7 @@ update subrecipe set prep_type='assemble', skill='helper', fridge_days=2, freeze
 update subrecipe set prep_type='assemble', skill='helper', fridge_days=7, freezer_days=null where id = 26;     -- Akli Blossom Honey (mixed)
 update subrecipe set prep_type='cook', fridge_days=1, freezer_days=null, equipment='stove' where id = 107;     -- Popcorn
 update subrecipe set freezable = (freezer_days is not null) where id in (26, 32, 33, 107);
+update subrecipe set prep_type='assemble', skill='helper', fridge_days=7, freezer_days=null where id = 173; -- Dibs w Tahini (mixed)
+update subrecipe set prep_type='assemble', skill='helper', fridge_days=3, freezer_days=null where id = 54;  -- Pickles (cut/portioned)
+update subrecipe set prep_type='assemble', skill='helper', fridge_days=1, freezer_days=null where id = 77;  -- Seasonal Fruit (cut)
+update subrecipe set freezable = false where id in (173, 54, 77);
