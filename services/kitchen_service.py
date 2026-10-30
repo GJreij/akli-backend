@@ -76,6 +76,7 @@ def _scaled_ingredients(sub_ingreds, ingredient_map, servings, digits=1):
             "quantity": round(qty, digits),
             "is_staple": bool(ing_def.get("is_staple")),
             "stored_frozen": bool(ing_def.get("stored_frozen")),
+            "thaw_hours": ing_def.get("thaw_hours"),
         })
     return sorted(out, key=lambda x: x["name"].lower())
 
@@ -136,11 +137,12 @@ def get_kitchen_day(cook_date_str):
 
     sub_ids = {s["subrecipe_id"] for s in servings} | {b["subrecipe_id"] for b in batches}
     if not sub_ids:
-        return {"cook_date": cook_date.isoformat(), "horizon_end": horizon_end.isoformat(), "subrecipes": []}
+        return {"cook_date": cook_date.isoformat(), "horizon_end": horizon_end.isoformat(),
+                "next_cook_date": None, "subrecipes": []}
 
     subs = {s["id"]: s for s in _fetch_in(
         "subrecipe",
-        "id, name, instructions, prep_type, skill, equipment, fridge_days, freezer_days, is_side_salad, active_minutes, total_minutes",
+        "id, name, instructions, prep_type, skill, equipment, fridge_days, freezer_days, is_side_salad, active_minutes, total_minutes, prep_ahead",
         "id", sub_ids,
     )}
     sub_ingreds = defaultdict(list)
@@ -228,7 +230,8 @@ def get_kitchen_day(cook_date_str):
                 "variant_note": b.get("variant_note"), "notes": b.get("notes"),
                 "_left": max(remaining, 0),
                 "_use_by": use_by, "_cooked_on": _d(b["cooked_on"]),
-                "allocated_servings": 0.0, "allocated_mpdr_ids": set(), "allocated_today_mpdr_ids": set(),
+                "allocated_servings": 0.0, "allocated_today_servings": 0.0,
+                "allocated_mpdr_ids": set(), "allocated_today_mpdr_ids": set(),
             })
         stock.sort(key=lambda x: x["_use_by"])
 
@@ -252,6 +255,7 @@ def get_kitchen_day(cook_date_str):
                     batch["allocated_servings"] += ln["servings"]
                     batch["allocated_mpdr_ids"].add(ln["mpdr_id"])
                     if ln["date"] == cook_date:
+                        batch["allocated_today_servings"] += ln["servings"]
                         batch["allocated_today_mpdr_ids"].add(ln["mpdr_id"])
             elif ln["date"] >= cook_date:
                 open_lines.append(ln)
@@ -290,6 +294,7 @@ def get_kitchen_day(cook_date_str):
 
         for st in stock:
             st["allocated_servings"] = round(st["allocated_servings"], 2)
+            st["allocated_today_servings"] = round(st["allocated_today_servings"], 2)
             st["allocated_mpdr_ids"] = sorted(st["allocated_mpdr_ids"])
             st["allocated_today_mpdr_ids"] = sorted(st["allocated_today_mpdr_ids"])
             st["unallocated"] = round(st.pop("_left"), 2)  # left over after covering the next days
@@ -308,6 +313,7 @@ def get_kitchen_day(cook_date_str):
             "freezer_days": freezer_days,
             "active_minutes": sub.get("active_minutes"),
             "total_minutes": sub.get("total_minutes"),
+            "prep_ahead": sub.get("prep_ahead"),
             "recipes": sorted({recipes[ln["recipe_id"]]["name"] for ln in today_lines + suggested
                                if ln["recipe_id"] in recipes}),
             "today": {
@@ -330,6 +336,12 @@ def get_kitchen_day(cook_date_str):
             "ingredients_per_serving": _scaled_ingredients(sub_ingreds[sub_id], ingredient_map, 1, digits=4),
         })
 
+    # Next date with live deliveries after cook_date (Kitchen Day > Tomorrow).
+    live_mpd_set = set(live_mpd_ids)
+    next_dates = sorted({d["delivery_date"][:10] for mid, d in delivery_by_mpd.items()
+                         if mid in live_mpd_set and _d(d["delivery_date"]) > cook_date})
+
     prep_rank = {"cook": 0, "assemble": 1, "ready": 2}
     out.sort(key=lambda x: (prep_rank.get(x["prep_type"], 9), -x["must_cook"]["servings"], x["name"].lower()))
-    return {"cook_date": cook_date.isoformat(), "horizon_end": horizon_end.isoformat(), "subrecipes": out}
+    return {"cook_date": cook_date.isoformat(), "horizon_end": horizon_end.isoformat(),
+            "next_cook_date": next_dates[0] if next_dates else None, "subrecipes": out}

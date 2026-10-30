@@ -14,4 +14,5 @@ alter table public.subrecipe
   drop column if exists equipment,
   drop column if exists active_minutes,
   drop column if exists total_minutes,
-  drop column if exists skill;
+  drop column if exists skill,
+  drop column if exists prep_ahead;
