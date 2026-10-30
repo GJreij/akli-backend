@@ -15,6 +15,7 @@ from routes.delivery import delivery_bp
 from routes.cancellation_routes import cancellation_bp
 from routes.meal_swap_routes import meal_swap_bp
 from routes.day_edit_routes import day_edit_bp
+from routes.kitchen import kitchen_bp
 import os
 
 app = Flask(__name__)
@@ -36,6 +37,7 @@ app.register_blueprint(delivery_bp)
 app.register_blueprint(cancellation_bp)
 app.register_blueprint(meal_swap_bp)
 app.register_blueprint(day_edit_bp)
+app.register_blueprint(kitchen_bp)
 
 @app.route("/")
 def home():
