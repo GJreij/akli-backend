@@ -19,11 +19,16 @@ open becomes the cook list:
 
 Orders have a 48h lead time (utils/dates.beirut_iso_date), so cook_date and
 the day after are final; later days can still grow.
+
+kitchen_settings shapes the cook-ahead window: with cook days set (e.g.
+Sun/Tue/Thu) a batch only needs to last until the day before the next cook
+day, and late_order_buffer_pct adds a margin on days still open to orders.
 """
 
 from collections import defaultdict
 from datetime import date, timedelta
 
+from utils.dates import beirut_iso_date
 from utils.supabase_client import supabase
 from utils.supabase_paging import fetch_all
 
@@ -53,6 +58,30 @@ def _fetch_in(table, select, column, ids, extra=None):
 
 def _d(s):
     return date.fromisoformat(s[:10])
+
+
+def _dow(d):
+    """0 = Sunday … 6 = Saturday (kitchen_settings.cook_days)."""
+    return (d.weekday() + 1) % 7
+
+
+def get_kitchen_settings():
+    rows = supabase.table("kitchen_settings").select("cook_days, late_order_buffer_pct").eq("tenant_id", 1).execute().data or []
+    row = rows[0] if rows else {}
+    return {
+        "cook_days": sorted({int(x) for x in (row.get("cook_days") or [])}),
+        "late_order_buffer_pct": int(row.get("late_order_buffer_pct") or 0),
+    }
+
+
+def _next_cook_day(after, cook_days):
+    if not cook_days:
+        return None
+    for i in range(1, 15):
+        d = after + timedelta(days=i)
+        if _dow(d) in cook_days:
+            return d
+    return None
 
 
 def _batch_use_by(batch, sub):
@@ -88,6 +117,12 @@ def get_kitchen_day(cook_date_str):
     batches = fetch_all(lambda lo, hi: (
         supabase.table("kitchen_batch").select("*").eq("status", "active").order("id").range(lo, hi)
     ))
+    settings = get_kitchen_settings()
+    next_planned = _next_cook_day(cook_date, settings["cook_days"])
+    # Last day today's batch has to cover: the day before the next cook day.
+    window_end = next_planned - timedelta(days=1) if next_planned else horizon_end
+    open_from = _d(beirut_iso_date(2))  # first date that can still take orders
+    buffer_pct = settings["late_order_buffer_pct"]
 
     # Most portions are weighed by eye, not through the portioning panel, so
     # a batch can't rely on batch_id links alone to be used up. Demand is
@@ -138,7 +173,10 @@ def get_kitchen_day(cook_date_str):
     sub_ids = {s["subrecipe_id"] for s in servings} | {b["subrecipe_id"] for b in batches}
     if not sub_ids:
         return {"cook_date": cook_date.isoformat(), "horizon_end": horizon_end.isoformat(),
-                "next_cook_date": None, "subrecipes": []}
+                "next_cook_date": None, "settings": settings,
+                "is_cook_day": (_dow(cook_date) in settings["cook_days"]) if settings["cook_days"] else None,
+                "next_planned_cook_day": next_planned.isoformat() if next_planned else None,
+                "subrecipes": []}
 
     subs = {s["id"]: s for s in _fetch_in(
         "subrecipe",
@@ -172,6 +210,12 @@ def get_kitchen_day(cook_date_str):
             key = (p["recipe_id"], p["user_id"])
             if key not in recipe_comments or (p.get("updated_at") or "") > (recipe_comments[key].get("updated_at") or ""):
                 recipe_comments[key] = p
+    handling_by_key = {}
+    for h in _fetch_in("kitchen_comment_handling",
+                       "id, user_id, recipe_id, subrecipe_id, comment, handling, instruction, decided_by",
+                       "user_id", user_ids):
+        handling_by_key[(h["user_id"], h.get("recipe_id") or 0, h["subrecipe_id"], (h["comment"] or "").strip())] = h
+
     salad_comments = {}
     salad_ids = [sid for sid, s in subs.items() if s.get("is_side_salad")]
     if salad_ids:
@@ -263,9 +307,9 @@ def get_kitchen_day(cook_date_str):
             for st in stock:
                 st["remaining"] = round(st["_left"], 2)
 
-        fridge_end = cook_date + timedelta(days=sub.get("fridge_days") or 0)
+        fridge_end = min(cook_date + timedelta(days=sub.get("fridge_days") or 0), window_end)
         freezer_days = sub.get("freezer_days")
-        freeze_end = min(horizon_end, cook_date + timedelta(days=freezer_days)) if freezer_days else None
+        freeze_end = min(horizon_end, window_end, cook_date + timedelta(days=freezer_days)) if freezer_days else None
 
         today_lines = [ln for ln in lines if ln["date"] == cook_date]
         must = [ln for ln in open_lines if ln["date"] == cook_date]
@@ -282,15 +326,42 @@ def get_kitchen_day(cook_date_str):
             return [{"date": k, "servings": round(v, 2)} for k, v in sorted(acc.items())]
 
         comment_lines = today_lines + suggested
-        comments, seen = [], set()
+        comments, seen = [], {}
         for ln in comment_lines:
             uid = ln["user_id"]
-            text = salad_comments.get((sub_id, uid)) if sub.get("is_side_salad") else (
+            is_salad = bool(sub.get("is_side_salad"))
+            text = salad_comments.get((sub_id, uid)) if is_salad else (
                 (recipe_comments.get((ln["recipe_id"], uid)) or {}).get("comment"))
-            if text and (uid, text) not in seen:
-                seen.add((uid, text))
-                comments.append({"user_id": uid, "name": _name(uid), "comment": text.strip(),
-                                 "date": ln["date"].isoformat(), "servings": ln["servings"]})
+            if not text:
+                continue
+            text = text.strip()
+            rid = None if is_salad else ln["recipe_id"]
+            key = (uid, rid or 0, text)
+            if key not in seen:
+                h = handling_by_key.get((uid, rid or 0, sub_id, text)) or {}
+                entry = {"user_id": uid, "name": _name(uid), "comment": text,
+                         "recipe_id": rid, "recipe_name": (recipes.get(rid) or {}).get("name") if rid else None,
+                         "date": ln["date"].isoformat(), "servings": ln["servings"],
+                         "handling": h.get("handling"), "instruction": h.get("instruction"),
+                         "decided_by": h.get("decided_by"),
+                         # this client's open servings, for a separate pot
+                         "servings_must": 0.0, "servings_suggested": 0.0}
+                seen[key] = entry
+                comments.append(entry)
+        for ln in open_lines:
+            for entry in comments:
+                if entry["user_id"] == ln["user_id"] and entry["recipe_id"] in (None, ln["recipe_id"]):
+                    if ln["date"] == cook_date:
+                        entry["servings_must"] += ln["servings"]
+                    if ln["date"] <= fridge_end:
+                        entry["servings_suggested"] += ln["servings"]
+        for entry in comments:
+            entry["servings_must"] = round(entry["servings_must"], 2)
+            entry["servings_suggested"] = round(entry["servings_suggested"], 2)
+
+        def _buffer(ls):
+            open_s = sum(ln["servings"] for ln in ls if ln["date"] >= open_from)
+            return round(open_s * buffer_pct / 100, 2) if buffer_pct else 0.0
 
         for st in stock:
             st["allocated_servings"] = round(st["allocated_servings"], 2)
@@ -301,7 +372,10 @@ def get_kitchen_day(cook_date_str):
             st.pop("_use_by")
             st.pop("_cooked_on")
 
-        must_s, sugg_s, freeze_s = _sum(must), _sum(suggested), _sum(freeze)
+        sugg_buffer, freeze_buffer = _buffer(suggested), _buffer(freeze)
+        must_s = _sum(must)
+        sugg_s = round(_sum(suggested) + sugg_buffer, 2)
+        freeze_s = round(_sum(freeze) + freeze_buffer, 2)
         out.append({
             "subrecipe_id": sub_id,
             "name": sub["name"],
@@ -324,10 +398,10 @@ def get_kitchen_day(cook_date_str):
             "stock": stock,
             "must_cook": {"servings": must_s, "mpdr_ids": sorted({ln["mpdr_id"] for ln in must}),
                           "ingredients": _scaled_ingredients(sub_ingreds[sub_id], ingredient_map, must_s)},
-            "suggested": {"servings": sugg_s, "through": fridge_end.isoformat(), "by_date": _by_date(suggested),
+            "suggested": {"servings": sugg_s, "buffer": sugg_buffer, "through": fridge_end.isoformat(), "by_date": _by_date(suggested),
                           "mpdr_ids": sorted({ln["mpdr_id"] for ln in suggested}),
                           "ingredients": _scaled_ingredients(sub_ingreds[sub_id], ingredient_map, sugg_s)},
-            "freeze": ({"servings": freeze_s, "through": freeze_end.isoformat(), "by_date": _by_date(freeze),
+            "freeze": ({"servings": freeze_s, "buffer": freeze_buffer, "through": freeze_end.isoformat(), "by_date": _by_date(freeze),
                         "mpdr_ids": sorted({ln["mpdr_id"] for ln in freeze}),
                         "ingredients": _scaled_ingredients(sub_ingreds[sub_id], ingredient_map, freeze_s)}
                        if freeze else None),
@@ -344,4 +418,66 @@ def get_kitchen_day(cook_date_str):
     prep_rank = {"cook": 0, "assemble": 1, "ready": 2}
     out.sort(key=lambda x: (prep_rank.get(x["prep_type"], 9), -x["must_cook"]["servings"], x["name"].lower()))
     return {"cook_date": cook_date.isoformat(), "horizon_end": horizon_end.isoformat(),
-            "next_cook_date": next_dates[0] if next_dates else None, "subrecipes": out}
+            "next_cook_date": next_dates[0] if next_dates else None,
+            "settings": settings,
+            "is_cook_day": (_dow(cook_date) in settings["cook_days"]) if settings["cook_days"] else None,
+            "next_planned_cook_day": next_planned.isoformat() if next_planned else None,
+            "subrecipes": out}
+
+
+def get_kitchen_week(start_str):
+    """Ordered servings per subrecipe per delivery date for 7 days from
+    start — the raw demand the Week view and the assistant plan cook days
+    from (stock is per day, see get_kitchen_day)."""
+    start = _d(start_str)
+    end = start + timedelta(days=6)
+    deliveries = fetch_all(lambda lo, hi: (
+        supabase.table("deliveries")
+        .select("id, meal_plan_day_id, delivery_date")
+        .gte("delivery_date", start.isoformat())
+        .lte("delivery_date", end.isoformat())
+        .order("id")
+        .range(lo, hi)
+    ))
+    date_by_mpd = {}
+    for d in deliveries:
+        mid = d.get("meal_plan_day_id")
+        if mid and (mid not in date_by_mpd or d["delivery_date"] < date_by_mpd[mid]):
+            date_by_mpd[mid] = d["delivery_date"][:10]
+    mpds = _fetch_in("meal_plan_day", "id, status", "id", date_by_mpd.keys())
+    live = [m["id"] for m in mpds if m.get("status") not in ("cancellation_pending", "cancelled")]
+    mpdrs = {r["id"]: r for r in _fetch_in("meal_plan_day_recipe", "id, meal_plan_day_id", "meal_plan_day_id", live)}
+    servings = _fetch_in("meal_plan_day_recipe_serving",
+                         "meal_plan_day_recipe_id, subrecipe_id, recipe_subrecipe_serving_calculated",
+                         "meal_plan_day_recipe_id", mpdrs.keys())
+
+    by_sub = defaultdict(lambda: defaultdict(float))
+    for sv in servings:
+        n = sv.get("recipe_subrecipe_serving_calculated") or 0
+        if not sv.get("subrecipe_id") or n <= 0:
+            continue
+        day = date_by_mpd.get(mpdrs[sv["meal_plan_day_recipe_id"]]["meal_plan_day_id"])
+        if day:
+            by_sub[sv["subrecipe_id"]][day] += n
+
+    subs = {x["id"]: x for x in _fetch_in(
+        "subrecipe", "id, name, prep_type, skill, equipment, fridge_days, freezer_days, active_minutes, total_minutes",
+        "id", by_sub.keys())}
+    dates = [(start + timedelta(days=i)).isoformat() for i in range(7)]
+    rows = []
+    for sid, per_day in by_sub.items():
+        sub = subs.get(sid)
+        if not sub:
+            continue
+        rows.append({
+            "subrecipe_id": sid, "name": sub["name"], "prep_type": sub.get("prep_type") or "cook",
+            "skill": sub.get("skill") or "chef", "equipment": sub.get("equipment"),
+            "fridge_days": sub.get("fridge_days"), "freezer_days": sub.get("freezer_days"),
+            "active_minutes": sub.get("active_minutes"), "total_minutes": sub.get("total_minutes"),
+            "by_date": {d: round(per_day.get(d, 0), 2) for d in dates},
+            "total": round(sum(per_day.values()), 2),
+        })
+    prep_rank = {"cook": 0, "assemble": 1, "ready": 2}
+    rows.sort(key=lambda r: (prep_rank.get(r["prep_type"], 9), -r["total"], r["name"].lower()))
+    return {"start": start.isoformat(), "end": end.isoformat(), "dates": dates,
+            "open_from": beirut_iso_date(2), "settings": get_kitchen_settings(), "subrecipes": rows}
