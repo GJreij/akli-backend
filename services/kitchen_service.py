@@ -276,6 +276,7 @@ def get_kitchen_day(cook_date_str):
                 "_use_by": use_by, "_cooked_on": _d(b["cooked_on"]),
                 "allocated_servings": 0.0, "allocated_today_servings": 0.0,
                 "allocated_mpdr_ids": set(), "allocated_today_mpdr_ids": set(),
+                "_by_date": defaultdict(lambda: {"servings": 0.0, "mpdr_ids": set()}),
             })
         stock.sort(key=lambda x: x["_use_by"])
 
@@ -298,6 +299,9 @@ def get_kitchen_day(cook_date_str):
                 if ln["date"] >= cook_date:
                     batch["allocated_servings"] += ln["servings"]
                     batch["allocated_mpdr_ids"].add(ln["mpdr_id"])
+                    day = batch["_by_date"][ln["date"].isoformat()]
+                    day["servings"] += ln["servings"]
+                    day["mpdr_ids"].add(ln["mpdr_id"])
                     if ln["date"] == cook_date:
                         batch["allocated_today_servings"] += ln["servings"]
                         batch["allocated_today_mpdr_ids"].add(ln["mpdr_id"])
@@ -321,9 +325,11 @@ def get_kitchen_day(cook_date_str):
 
         def _by_date(ls):
             acc = defaultdict(float)
+            ids = defaultdict(set)
             for ln in ls:
                 acc[ln["date"].isoformat()] += ln["servings"]
-            return [{"date": k, "servings": round(v, 2)} for k, v in sorted(acc.items())]
+                ids[ln["date"].isoformat()].add(ln["mpdr_id"])
+            return [{"date": k, "servings": round(v, 2), "mpdr_ids": sorted(ids[k])} for k, v in sorted(acc.items())]
 
         comment_lines = today_lines + suggested
         comments, seen = [], {}
@@ -368,6 +374,9 @@ def get_kitchen_day(cook_date_str):
             st["allocated_today_servings"] = round(st["allocated_today_servings"], 2)
             st["allocated_mpdr_ids"] = sorted(st["allocated_mpdr_ids"])
             st["allocated_today_mpdr_ids"] = sorted(st["allocated_today_mpdr_ids"])
+            # Per delivery date, for "portion several days" on Kitchen Day.
+            st["allocated_by_date"] = [{"date": k, "servings": round(v["servings"], 2), "mpdr_ids": sorted(v["mpdr_ids"])}
+                                       for k, v in sorted(st.pop("_by_date").items())]
             st["unallocated"] = round(st.pop("_left"), 2)  # left over after covering the next days
             st.pop("_use_by")
             st.pop("_cooked_on")
@@ -381,6 +390,7 @@ def get_kitchen_day(cook_date_str):
             "name": sub["name"],
             "instructions": sub.get("instructions"),
             "prep_type": sub.get("prep_type") or "cook",
+            "is_side_salad": bool(sub.get("is_side_salad")),
             "skill": sub.get("skill") or "chef",
             "equipment": sub.get("equipment"),
             "fridge_days": sub.get("fridge_days"),
