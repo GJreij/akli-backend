@@ -425,7 +425,7 @@ def get_kitchen_day(cook_date_str):
     next_dates = sorted({d["delivery_date"][:10] for mid, d in delivery_by_mpd.items()
                          if mid in live_mpd_set and _d(d["delivery_date"]) > cook_date})
 
-    prep_rank = {"cook": 0, "assemble": 1, "ready": 2}
+    prep_rank = {"cook": 0, "assemble": 1, "slice": 2, "ready": 3}
     out.sort(key=lambda x: (prep_rank.get(x["prep_type"], 9), -x["must_cook"]["servings"], x["name"].lower()))
     return {"cook_date": cook_date.isoformat(), "horizon_end": horizon_end.isoformat(),
             "next_cook_date": next_dates[0] if next_dates else None,
@@ -487,7 +487,7 @@ def get_kitchen_week(start_str):
             "by_date": {d: round(per_day.get(d, 0), 2) for d in dates},
             "total": round(sum(per_day.values()), 2),
         })
-    prep_rank = {"cook": 0, "assemble": 1, "ready": 2}
+    prep_rank = {"cook": 0, "assemble": 1, "slice": 2, "ready": 3}
     rows.sort(key=lambda r: (prep_rank.get(r["prep_type"], 9), -r["total"], r["name"].lower()))
     return {"start": start.isoformat(), "end": end.isoformat(), "dates": dates,
             "open_from": beirut_iso_date(2), "settings": get_kitchen_settings(), "subrecipes": rows}
