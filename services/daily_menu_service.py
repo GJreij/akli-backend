@@ -29,11 +29,13 @@ Three layers, in order:
 
 import heapq
 import math
+import random
 from collections import defaultdict
 from datetime import date as date_cls, datetime, timedelta
 from typing import Any, Dict, List, Tuple
 
 from utils.supabase_client import supabase
+from utils.supabase_paging import fetch_all
 from services.mealplan_service import optimize_subrecipes
 
 MEAL_TYPES = ("breakfast", "lunch", "dinner", "snack")
@@ -71,6 +73,30 @@ REPAIRABLE_TIERS = ("BEST_EFFORT_LP", "SAFE_FALLBACK")
 # LP tier/pass produced the result — see needs_repair() below for why.
 REPAIR_KCAL_DEVIATION_THRESHOLD  = 0.20
 REPAIR_MACRO_DEVIATION_THRESHOLD = 0.30
+
+# Per-client variety (2026-11-06). Repeats used to be tracked per meal
+# type with a set that filled up after one pass through the pool, after
+# which the swap fallback always returned the single best macro-fit
+# recipe (real plan 374: Overnight PB Oats 5x in 10 days, as breakfast
+# AND dinner, while 3 menu recipes were never used). Now every candidate
+# is penalised by how many times THIS client already has it anywhere in
+# the plan (all meal types), so the least-used recipe wins unless the
+# macro gap is large, and near-ties are broken at random so regenerating
+# doesn't return an identical plan. macro_compat_score spans roughly
+# -0.3..+1.2 across a real menu, so one prior use (1.5) outweighs almost
+# any macro difference — safe because the servings LP rebalances
+# portions afterwards anyway.
+REPEAT_PENALTY = 1.5
+NEAR_TIE_MARGIN = 0.4
+
+# PostgREST URL-length safety for big .in_() id lists.
+IN_CHUNK = 200
+
+
+def _chunks(seq: list, n: int = IN_CHUNK):
+    seq = list(seq)
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
 
 
 def needs_repair(day_totals: dict, macro_target: dict) -> bool:
@@ -196,17 +222,20 @@ def prefetch_weekday_popularity(recipe_ids: list, weekdays: list) -> dict:
     if not recipe_ids or not weekdays:
         return {}
     try:
-        resp = (
+        # Paginated: an unpaginated .in_() silently capped at 1000 rows
+        # (menu 37's recipes alone already had 1,023 order rows).
+        rows = fetch_all(lambda lo, hi: (
             supabase.table("meal_plan_day_recipe")
-            .select("recipe_id, meal_plan_day(date)")
+            .select("id, recipe_id, meal_plan_day(date)")
             .in_("recipe_id", recipe_ids)
-            .execute()
-        )
+            .order("id")
+            .range(lo, hi)
+        ))
     except Exception:
         return {(rid, wd): 0.5 for rid in recipe_ids for wd in weekdays}
 
     counts: dict = defaultdict(int)
-    for row in (resp.data or []):
+    for row in rows:
         rid = row.get("recipe_id")
         mpd = row.get("meal_plan_day") or {}
         date_str = mpd.get("date")
@@ -231,26 +260,44 @@ def fetch_last_eaten(user_id: str, recipe_ids: list) -> Dict[int, date_cls]:
     only), /confirm_order is the only write path, so this is always
     correct even if a kitchen admin edits an order via the FlutterFlow
     admin app instead of this backend."""
-    if not recipe_ids:
+    if not recipe_ids or not user_id:
         return {}
+    # Scoped to this user in the DB (plan ids -> day ids -> rows). The old
+    # version pulled EVERY client's rows for these recipes and filtered in
+    # Python, so past the 1000-row cap most of this client's history was
+    # silently missing.
     try:
-        resp = (
-            supabase.table("meal_plan_day_recipe")
-            .select("recipe_id, meal_plan_day(date, meal_plan(user_id))")
-            .in_("recipe_id", recipe_ids)
-            .execute()
-        )
+        plan_ids = [
+            r["id"] for r in fetch_all(lambda lo, hi: (
+                supabase.table("meal_plan").select("id")
+                .eq("user_id", user_id).order("id").range(lo, hi)
+            ))
+        ]
+        if not plan_ids:
+            return {}
+        day_date: Dict[int, str] = {}
+        for chunk in _chunks(plan_ids):
+            for r in fetch_all(lambda lo, hi, c=chunk: (
+                supabase.table("meal_plan_day").select("id, date")
+                .in_("meal_plan_id", c).order("id").range(lo, hi)
+            )):
+                if r.get("id") is not None and r.get("date"):
+                    day_date[r["id"]] = r["date"]
+        rows = []
+        for chunk in _chunks(list(day_date.keys())):
+            rows.extend(fetch_all(lambda lo, hi, c=chunk: (
+                supabase.table("meal_plan_day_recipe")
+                .select("id, meal_plan_day_id, recipe_id")
+                .in_("meal_plan_day_id", c).in_("recipe_id", recipe_ids)
+                .order("id").range(lo, hi)
+            )))
     except Exception:
         return {}
 
     last_eaten: Dict[int, date_cls] = {}
-    for row in (resp.data or []):
+    for row in rows:
         rid = row.get("recipe_id")
-        mpd = row.get("meal_plan_day") or {}
-        mp  = mpd.get("meal_plan") or {}
-        if mp.get("user_id") != user_id:
-            continue
-        date_str = mpd.get("date")
+        date_str = day_date.get(row.get("meal_plan_day_id"))
         if rid is None or not date_str:
             continue
         try:
@@ -277,17 +324,18 @@ def fetch_other_orders_by_date(
         return {}
     date_strs = [str(d) for d in date_range]
     try:
-        days_resp = (
+        days_rows = fetch_all(lambda lo, hi: (
             supabase.table("meal_plan_day")
             .select("id, date, meal_plan(user_id)")
             .in_("date", date_strs)
-            .execute()
-        )
+            .order("id")
+            .range(lo, hi)
+        ))
     except Exception:
         return {}
 
     day_id_to_date_user: Dict[int, Tuple[date_cls, str]] = {}
-    for row in (days_resp.data or []):
+    for row in days_rows:
         mp = row.get("meal_plan") or {}
         uid = mp.get("user_id")
         if uid == exclude_user_id or not uid:
@@ -305,12 +353,15 @@ def fetch_other_orders_by_date(
         return {}
 
     try:
-        recipes_resp = (
-            supabase.table("meal_plan_day_recipe")
-            .select("meal_plan_day_id, recipe_id, meal_type")
-            .in_("meal_plan_day_id", list(day_id_to_date_user.keys()))
-            .execute()
-        )
+        recipe_rows = []
+        for chunk in _chunks(list(day_id_to_date_user.keys())):
+            recipe_rows.extend(fetch_all(lambda lo, hi, c=chunk: (
+                supabase.table("meal_plan_day_recipe")
+                .select("id, meal_plan_day_id, recipe_id, meal_type")
+                .in_("meal_plan_day_id", c)
+                .order("id")
+                .range(lo, hi)
+            )))
     except Exception:
         return {}
 
@@ -320,7 +371,7 @@ def fetch_other_orders_by_date(
     # is the concrete fix for "I can't copy that" (a lone client's own
     # repeat shouldn't look like kitchen consensus).
     voters: Dict[Tuple[date_cls, str, int], set] = defaultdict(set)
-    for row in (recipes_resp.data or []):
+    for row in recipe_rows:
         entry = day_id_to_date_user.get(row.get("meal_plan_day_id"))
         rid = row.get("recipe_id")
         mt = row.get("meal_type")
@@ -560,8 +611,18 @@ def _rank_and_schedule(
             # for the rest of the range (confirmed via fresh testing on
             # 2026-08-18: pool=2/30-day range collapsed to 10 straight
             # identical days without this check).
+            # First try: avoid EVERY recipe from yesterday (any slot), not
+            # just this slot's. Lunch and dinner are scheduled from nearly
+            # the same ranked pool, so same-slot-only exclusion produced a
+            # staircase (lunch on day N == dinner on day N+1, every day of
+            # the real Nov 16-27 template), which every lunch+dinner client
+            # then had to swap away from. Falls back to same-slot only,
+            # then to no yesterday exclusion, for tiny pools.
             chosen_rid = None
-            if prev_rid is not None:
+            prev_all = {r for r in prev_day_map.values() if r is not None}
+            if prev_all:
+                chosen_rid = _select_for_meal_type(st, day_idx, used_today | prev_all, week_used)
+            if chosen_rid is None and prev_rid is not None:
                 chosen_rid = _select_for_meal_type(st, day_idx, used_today | {prev_rid}, week_used)
             if chosen_rid is None:
                 chosen_rid = _select_for_meal_type(st, day_idx, used_today, week_used)
@@ -876,6 +937,43 @@ def build_week_templates(
 # LAYER 2: per-client override (dislikes/exclusions/missing/self-collision)
 # =============================================================================
 
+def _client_candidates(
+    meal_type: str, allowed_ids_today: set, used_today: set, exclude: set,
+    user_prefs: dict, recipe_lookup: dict, recipe_macros: dict, macro_target: dict,
+    plan_counts: Dict[int, int],
+) -> List[Tuple[int, float]]:
+    """(rid, effective_score) for every recipe this client could eat in
+    this slot today. effective = macro fit + like/dislike bias - a penalty
+    per time this client already has the recipe ANYWHERE in the plan."""
+    pairs = []
+    for rid in allowed_ids_today:
+        recipe = recipe_lookup.get(rid)
+        if not recipe or rid in used_today or rid in exclude:
+            continue
+        if not recipe.get(f"could_be_{meal_type}", False):
+            continue
+        pref = user_prefs.get(rid, {})
+        if pref.get("dont_include"):
+            continue
+        base = macro_compat_score(rid, recipe_macros, macro_target)
+        if base < MACRO_COMPAT_HARD_FILTER:
+            continue
+        if pref.get("like"):
+            base += 2.0
+        if pref.get("dislike"):
+            base -= 5.0
+        pairs.append((rid, base - REPEAT_PENALTY * plan_counts.get(rid, 0)))
+    return pairs
+
+
+def _pick_varied(pairs: List[Tuple[int, float]], rng: random.Random) -> int:
+    """Random pick among candidates within NEAR_TIE_MARGIN of the best
+    effective score. Sorted first so a seeded rng is reproducible."""
+    best = max(s for _, s in pairs)
+    near = sorted(rid for rid, s in pairs if s >= best - NEAR_TIE_MARGIN)
+    return rng.choice(near)
+
+
 def apply_client_overrides(
     template_for_date: Dict[str, dict],
     meals_map: dict,
@@ -884,33 +982,38 @@ def apply_client_overrides(
     recipe_lookup: dict,
     recipe_macros: dict,
     macro_target: dict,
-    week_used_by_type: Dict[str, set] | None = None,
+    plan_counts: Dict[int, int] | None = None,
     previous_day_recipes: set | None = None,
+    rng: random.Random | None = None,
 ) -> Dict[str, dict] | None:
-    """Swaps out slots that don't work for THIS client: disliked/excluded/
-    missing recipes (existing correct pattern), and same-day self-
-    collision (this client requested two meal_keys that the shared
-    template happens to point at the same batched recipe — allowed and
-    desired across DIFFERENT clients, never for one client's own day).
-    Personal like/dislike bias enters HERE, never in build_week_templates.
-    Returns None if a slot cannot be filled at all (mirrors prior
-    behavior: caller returns a 404 for that date).
+    """Per-CLIENT layer on top of the shared template. A template slot is
+    kept (preserving kitchen batching) unless, for THIS client, it is
+    missing / disliked / excluded / not on today's menu / a same-day
+    self-collision / one of yesterday's recipes (any slot) / or the client
+    already has it more times in this plan than some other valid option
+    for the slot. Swapped slots pick the least-used recipe (see
+    REPEAT_PENALTY), random among near-ties.
 
-    Swap candidates are filtered through the same three-tier fallback as
-    _best_alternative: prefer a recipe this client hasn't had anywhere
-    else this week; if none qualify, allow a within-week repeat as long
-    as it isn't the immediately preceding day's pick; only if even that's
-    exhausted (tiny pool) does a same-week-and-adjacent-day repeat become
-    acceptable. week_used_by_type/previous_day_recipes are optional so
-    this still works standalone (e.g. for a high-kcal client's day-1
-    call, where there's no "week so far" yet).
+    `plan_counts` = {recipe_id: times already in THIS client's plan, any
+    meal type}. Replaces the old per-meal-type week_used set, which (a)
+    let the same dish return in a different slot and (b) saturated after
+    one pass through the pool, after which the fallback always returned
+    the single best-macro recipe every other day.
+    Returns None if a slot cannot be filled at all (caller 404s).
     """
-    week_used_by_type = week_used_by_type or {}
+    plan_counts = plan_counts or {}
     previous_day_recipes = previous_day_recipes or set()
+    rng = rng or random.Random()
 
     recipes_by_meal: Dict[str, dict] = {}
     used_today: set = set()
     needs_swap: List[Tuple[str, str]] = []
+
+    def cands(meal_type: str, exclude: set) -> List[Tuple[int, float]]:
+        return _client_candidates(
+            meal_type, allowed_ids_today, used_today, exclude, user_prefs,
+            recipe_lookup, recipe_macros, macro_target, plan_counts,
+        )
 
     for meal_key, meal_type in meals_map.items():
         info = template_for_date.get(meal_key)
@@ -922,59 +1025,34 @@ def apply_client_overrides(
             or pref.get("dont_include")
             or pref.get("dislike")
             or rid not in allowed_ids_today
-            or rid in used_today       # self-collision with an earlier slot this same date
-            or rid in previous_day_recipes  # adjacent-day repeat for THIS client
+            or rid in used_today            # self-collision with an earlier slot this same date
+            or rid in previous_day_recipes  # yesterday's dish, any slot, for THIS client
         ):
             needs_swap.append((meal_key, meal_type))
             continue
+
+        # Over-use check, loosened so the shared pick (kitchen batching)
+        # survives unless this client would have it 2+ more times than
+        # some other valid option. A strict "any less-used alternative"
+        # rule was tested on 15 real clients: +40% distinct dishes cooked
+        # per day for little extra variety.
+        count = plan_counts.get(rid, 0)
+        if count > 1:
+            alts = cands(meal_type, previous_day_recipes | {rid})
+            if alts and min(plan_counts.get(a, 0) for a, _ in alts) + 1 < count:
+                needs_swap.append((meal_key, meal_type))
+                continue
 
         recipes_by_meal[meal_key] = dict(info)
         used_today.add(rid)
 
     for meal_key, meal_type in needs_swap:
-        week_used = week_used_by_type.get(meal_type, set())
-
-        def score_candidates(exclude: set) -> list:
-            pairs = []
-            for rid in allowed_ids_today:
-                recipe = recipe_lookup.get(rid)
-                if not recipe or rid in used_today or rid in exclude:
-                    continue
-                if not recipe.get(f"could_be_{meal_type}", False):
-                    continue
-                if user_prefs.get(rid, {}).get("dont_include"):
-                    continue
-                if macro_compat_score(rid, recipe_macros, macro_target) < MACRO_COMPAT_HARD_FILTER:
-                    continue
-                score = macro_compat_score(rid, recipe_macros, macro_target)
-                if user_prefs.get(rid, {}).get("like"):
-                    score += 2.0
-                if user_prefs.get(rid, {}).get("dislike"):
-                    score -= 5.0
-                pairs.append((rid, score))
-            return pairs
-
-        # Tier 1: no repeat anywhere in this client's week, INCLUDING
-        # yesterday. Bug found via fresh testing (2026-08-18): this used
-        # to exclude only `week_used`, not `previous_day_recipes` -- so a
-        # recipe flagged for swap specifically BECAUSE it repeated
-        # yesterday could immediately re-select itself as its own
-        # replacement (week_used starts empty on any client's first swap
-        # of the day, so tier 1 always had candidates and tier 2 -- the
-        # one that actually excludes yesterday -- never got a chance to
-        # run).
-        pairs = score_candidates(week_used | previous_day_recipes)
-        # Tier 2: allow a within-week repeat, but never yesterday's pick.
-        if not pairs:
-            pairs = score_candidates(previous_day_recipes)
-        # Tier 3: true last resort - only today's own self-collision excluded.
-        if not pairs:
-            pairs = score_candidates(set())
-
+        # Never yesterday's dishes unless the pool leaves no choice.
+        pairs = cands(meal_type, previous_day_recipes) or cands(meal_type, set())
         if not pairs:
             return None
 
-        chosen_rid = max(pairs, key=lambda p: p[1])[0]
+        chosen_rid = _pick_varied(pairs, rng)
         recipe = recipe_lookup.get(chosen_rid, {})
         recipes_by_meal[meal_key] = {
             "recipe_id":   chosen_rid,
@@ -985,7 +1063,8 @@ def apply_client_overrides(
         }
         used_today.add(chosen_rid)
 
-    return recipes_by_meal
+    # Keep the caller's meals_map ordering.
+    return {mk: recipes_by_meal[mk] for mk in meals_map if mk in recipes_by_meal}
 
 
 # =============================================================================
@@ -1010,30 +1089,29 @@ def _flexibility_score(rid: int, flex_stats: dict) -> float:
 
 
 def _best_alternative(
-    meal_type: str, today_used: set, week_used: set, previous_day_recipes: set,
+    meal_type: str, today_used: set, plan_counts: Dict[int, int], previous_day_recipes: set,
     allowed_ids_today: set, eligible_by_meal_type: dict, recipe_macros: dict,
     macro_target: dict, last_eaten: Dict[int, date_cls], flex_stats: dict,
 ) -> int | None:
     """Three-tier fallback, in order — always excluding today's own picks
     (self-collision):
-      1. No repeat anywhere in this client's week. Among that pool, the
-         MOST FLEXIBLE candidate wins (most subrecipes + serving
-         headroom), macro fit as tiebreak — not just best macro fit alone.
-         This is a repair step, so the point isn't "closest match on
-         paper," it's "give the LP room to actually hit the target";
-         macro-similar but rigid (e.g. single-subrecipe) recipes were
-         repeatedly observed re-failing the very deviation check that
-         triggered the repair in the first place.
-      2. Whole-week-clean wasn't achievable — allow a within-week repeat,
-         but NEVER the immediately preceding day's pick (the adjacent-day
-         rule). Prefer whichever recipe this client ate longest ago.
-      3. Even that's exhausted (tiny pool) — true last resort, only
+      1. Not yet anywhere in this client's plan (any meal type). Among
+         that pool, the MOST FLEXIBLE candidate wins (most subrecipes +
+         serving headroom), macro fit as tiebreak. This is a repair step,
+         so the point is "give the LP room to actually hit the target";
+         macro-similar but rigid recipes were repeatedly observed
+         re-failing the very deviation check that triggered the repair.
+      2. Everything is already in the plan — allow a repeat, but NEVER one
+         of yesterday's dishes. Least-used in this plan first, then the
+         one this client ate longest ago historically, then flexibility.
+      3. Even that's exhausted (tiny pool) — same ordering, only
          self-collision excluded.
     """
-    pool = [
+    base = [
         rid for rid in eligible_by_meal_type.get(meal_type, [])
-        if rid not in today_used and rid not in week_used and rid in allowed_ids_today
+        if rid not in today_used and rid in allowed_ids_today
     ]
+    pool = [rid for rid in base if plan_counts.get(rid, 0) == 0]
     if pool:
         return max(
             pool,
@@ -1043,20 +1121,19 @@ def _best_alternative(
             ),
         )
 
-    candidates = [
-        rid for rid in eligible_by_meal_type.get(meal_type, [])
-        if rid not in today_used and rid not in previous_day_recipes and rid in allowed_ids_today
-    ]
-    if candidates:
-        return min(candidates, key=lambda rid: last_eaten.get(rid, date_cls.min))
+    def _repeat_key(rid):
+        return (
+            plan_counts.get(rid, 0),
+            last_eaten.get(rid, date_cls.min),
+            -_flexibility_score(rid, flex_stats),
+        )
 
-    final_candidates = [
-        rid for rid in eligible_by_meal_type.get(meal_type, [])
-        if rid not in today_used and rid in allowed_ids_today
-    ]
-    if not final_candidates:
+    candidates = [rid for rid in base if rid not in previous_day_recipes]
+    if candidates:
+        return min(candidates, key=_repeat_key)
+    if not base:
         return None
-    return min(final_candidates, key=lambda rid: last_eaten.get(rid, date_cls.min))
+    return min(base, key=_repeat_key)
 
 
 def repair_day_if_needed(
@@ -1067,7 +1144,7 @@ def repair_day_if_needed(
     allowed_ids_today: set,
     eligible_by_meal_type: dict,
     recipe_macros: dict,
-    week_used_by_type: Dict[str, set],
+    plan_counts: Dict[int, int],
     previous_day_recipes: set,
     last_eaten: Dict[int, date_cls],
     flex_stats: dict,
@@ -1123,9 +1200,8 @@ def repair_day_if_needed(
         target_mk = meal_key_by_type.get(target_type)
         if target_mk is None:
             continue  # this meal type wasn't requested today
-        week_used = week_used_by_type.get(target_type, set())
         alt = _best_alternative(
-            target_type, today_used, week_used, previous_day_recipes, allowed_ids_today,
+            target_type, today_used, plan_counts, previous_day_recipes, allowed_ids_today,
             eligible_by_meal_type, recipe_macros, macro_target, last_eaten, flex_stats,
         )
         if alt is None:

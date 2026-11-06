@@ -1,5 +1,6 @@
 from flask import Blueprint, request, jsonify
 from datetime import datetime, timedelta
+import random
 from collections import defaultdict
 
 from utils.supabase_client import supabase
@@ -108,6 +109,9 @@ def generate_meal_plan():
     raw_meals        = data.get("meals")
     kcal_override    = data.get("kcal_override")   # optional: client-computed reduced target
     kitchen_id       = data.get("kitchen_id")
+    # Optional, for reproducible tests only — production omits it so each
+    # generate breaks near-ties differently (variety on regenerate).
+    variety_seed     = data.get("variety_seed")
 
     if not user_id:
         return jsonify({"error": "user_id is required"}), 400
@@ -312,8 +316,12 @@ def generate_meal_plan():
     # 10. Generate plan - sequential, day-aware (carryover requires this)
     # ------------------------------------------------------------------
     days: list = []
-    week_used_by_type: dict = defaultdict(set)
+    # {recipe_id: times already in THIS client's plan, any meal type} —
+    # drives the least-used-first variety rule in apply_client_overrides /
+    # repair_day_if_needed.
+    plan_counts: dict = defaultdict(int)
     previous_day_recipes: set = set()  # this client's own picks from the immediately preceding day only
+    rng = random.Random(variety_seed)
     recipe_lookup = recipes_by_id
     salad_options_cache: dict = {}  # recipe_id -> salads the client may add to it
 
@@ -365,8 +373,9 @@ def generate_meal_plan():
             recipe_lookup=recipe_lookup,
             recipe_macros=recipe_macros,
             macro_target=target_with_kcal,
-            week_used_by_type=week_used_by_type,
+            plan_counts=plan_counts,
             previous_day_recipes=previous_day_recipes,
+            rng=rng,
         )
 
         if not recipes_by_meal:
@@ -398,7 +407,7 @@ def generate_meal_plan():
             allowed_ids_today=allowed_ids_today,
             eligible_by_meal_type=eligible_by_meal_type,
             recipe_macros=recipe_macros,
-            week_used_by_type=week_used_by_type,
+            plan_counts=plan_counts,
             previous_day_recipes=previous_day_recipes,
             last_eaten=last_eaten,
             flex_stats=flex_stats,
@@ -438,7 +447,7 @@ def generate_meal_plan():
             })
 
         for info in recipes_by_meal.values():
-            week_used_by_type[info["meal_type"]].add(info["recipe_id"])
+            plan_counts[info["recipe_id"]] += 1
         previous_day_recipes = {info["recipe_id"] for info in recipes_by_meal.values()}
 
         # Group optimized subrecipes back by meal slot
