@@ -435,6 +435,132 @@ def get_kitchen_day(cook_date_str):
             "subrecipes": out}
 
 
+def get_kitchen_simple(cook_date_str):
+    """Kitchen (simple screen): ordered servings per subrecipe for the 7 days
+    from cook_date, plus what the cook needs for cook_date itself — the
+    meal_plan_day_recipe ids to portion, ingredients per serving, recipe
+    instructions and client comments. No stock or batches: the cook types
+    what they have (kitchen_plan_item in Supabase)."""
+    start = _d(cook_date_str)
+    end = start + timedelta(days=HORIZON_DAYS - 1)
+    dates = [(start + timedelta(days=i)).isoformat() for i in range(HORIZON_DAYS)]
+
+    deliveries = fetch_all(lambda lo, hi: (
+        supabase.table("deliveries")
+        .select("id, meal_plan_day_id, user_id, delivery_date")
+        .gte("delivery_date", start.isoformat())
+        .lte("delivery_date", end.isoformat())
+        .order("id")
+        .range(lo, hi)
+    ))
+    delivery_by_mpd = {}
+    for d in deliveries:
+        mid = d.get("meal_plan_day_id")
+        if mid and (mid not in delivery_by_mpd or d["delivery_date"] < delivery_by_mpd[mid]["delivery_date"]):
+            delivery_by_mpd[mid] = d
+    mpds = _fetch_in("meal_plan_day", "id, status", "id", delivery_by_mpd.keys())
+    live = [m["id"] for m in mpds if m.get("status") not in ("cancellation_pending", "cancelled")]
+    mpdrs = {r["id"]: r for r in _fetch_in("meal_plan_day_recipe", "id, meal_plan_day_id, recipe_id", "meal_plan_day_id", live)}
+    servings = _fetch_in("meal_plan_day_recipe_serving",
+                         "id, meal_plan_day_recipe_id, subrecipe_id, recipe_subrecipe_serving_calculated",
+                         "meal_plan_day_recipe_id", mpdrs.keys())
+
+    today = start.isoformat()
+    by_sub = defaultdict(lambda: defaultdict(float))
+    today_mpdr = defaultdict(set)
+    # (subrecipe, user, recipe) delivered today: who to show comments for.
+    today_lines = defaultdict(set)
+    for sv in servings:
+        n = sv.get("recipe_subrecipe_serving_calculated") or 0
+        sid = sv.get("subrecipe_id")
+        if not sid or n <= 0:
+            continue
+        mpdr = mpdrs[sv["meal_plan_day_recipe_id"]]
+        deliv = delivery_by_mpd.get(mpdr["meal_plan_day_id"])
+        if not deliv:
+            continue
+        day = deliv["delivery_date"][:10]
+        by_sub[sid][day] += n
+        if day == today:
+            today_mpdr[sid].add(mpdr["id"])
+            today_lines[sid].add((deliv.get("user_id"), mpdr.get("recipe_id")))
+
+    sub_ids = list(by_sub.keys())
+    subs = {x["id"]: x for x in _fetch_in(
+        "subrecipe", "id, name, instructions, prep_type, is_side_salad", "id", sub_ids)}
+    sub_ingreds = defaultdict(list)
+    for si in _fetch_in("subrec_ingred", "id, subrecipe_id, ingredient_id, quantity", "subrecipe_id", sub_ids):
+        sub_ingreds[si["subrecipe_id"]].append(si)
+    ingredient_map = {i["id"]: i for i in _fetch_in(
+        "ingredient", "id, name, unit, serving_per_unit, is_staple, stored_frozen, thaw_hours",
+        "id", {si["ingredient_id"] for rows in sub_ingreds.values() for si in rows},
+    )}
+
+    # Comments, only for clients delivered today.
+    user_ids = list({u for lines in today_lines.values() for u, _ in lines if u})
+    users = {u["id"]: u for u in _fetch_in("user", "id, name, last_name", "id", user_ids)}
+
+    def _name(uid):
+        u = users.get(uid) or {}
+        return f"{(u.get('name') or '').strip()} {(u.get('last_name') or '').strip()}".strip() or "Unknown"
+
+    recipe_ids = {r for lines in today_lines.values() for _, r in lines if r}
+    recipes = {r["id"]: r for r in _fetch_in("recipe", "id, name", "id", recipe_ids)}
+    recipe_comments = {}
+    for p in _fetch_in("user_recipe_preferences", "id, recipe_id, user_id, comment, updated_at", "user_id", user_ids,
+                       extra=lambda q: q.not_.is_("comment", None)):
+        if (p.get("comment") or "").strip() and p.get("recipe_id") in recipe_ids:
+            key = (p["recipe_id"], p["user_id"])
+            if key not in recipe_comments or (p.get("updated_at") or "") > (recipe_comments[key].get("updated_at") or ""):
+                recipe_comments[key] = p
+    salad_comments = {}
+    for p in _fetch_in("user_side_salad_preference", "id, subrecipe_id, user_id, comment", "user_id", user_ids,
+                       extra=lambda q: q.not_.is_("comment", None)):
+        if (p.get("comment") or "").strip():
+            salad_comments[(p["subrecipe_id"], p["user_id"])] = p["comment"].strip()
+    handling = {}
+    for h in _fetch_in("kitchen_comment_handling", "id, user_id, recipe_id, subrecipe_id, comment, instruction",
+                       "user_id", user_ids):
+        handling[(h["user_id"], h.get("recipe_id") or 0, h["subrecipe_id"], (h["comment"] or "").strip())] = h.get("instruction")
+
+    rows = []
+    for sid, per_day in by_sub.items():
+        sub = subs.get(sid)
+        if not sub:
+            continue
+        is_salad = bool(sub.get("is_side_salad"))
+        comments, seen = [], set()
+        for uid, rid in sorted(today_lines.get(sid, ()), key=lambda x: (str(x[0]), x[1] or 0)):
+            text = salad_comments.get((sid, uid)) if is_salad else (recipe_comments.get((rid, uid)) or {}).get("comment")
+            if not text:
+                continue
+            text = text.strip()
+            key = (uid, None if is_salad else rid, text)
+            if key in seen:
+                continue
+            seen.add(key)
+            comments.append({
+                "user_id": uid, "name": _name(uid), "comment": text,
+                "recipe_id": None if is_salad else rid,
+                "recipe_name": None if is_salad else (recipes.get(rid) or {}).get("name"),
+                "instruction": handling.get((uid, 0 if is_salad else (rid or 0), sid, text)),
+            })
+        rows.append({
+            "subrecipe_id": sid,
+            "name": sub["name"],
+            "prep_type": sub.get("prep_type") or "cook",
+            "is_side_salad": is_salad,
+            "instructions": sub.get("instructions"),
+            "by_date": {d: round(per_day.get(d, 0), 2) for d in dates},
+            "today_mpdr_ids": sorted(today_mpdr.get(sid, ())),
+            "comments": comments,
+            "ingredients_per_serving": _scaled_ingredients(sub_ingreds[sid], ingredient_map, 1, digits=4),
+        })
+    prep_rank = {"cook": 0, "assemble": 1, "slice": 2, "ready": 3}
+    rows.sort(key=lambda r: (prep_rank.get(r["prep_type"], 9), -r["by_date"][today], r["name"].lower()))
+    return {"cook_date": today, "dates": dates, "subrecipes": rows}
+
+
 def get_kitchen_week(start_str):
     """Ordered servings per subrecipe per delivery date for 7 days from
     start — the raw demand the Week view and the assistant plan cook days
