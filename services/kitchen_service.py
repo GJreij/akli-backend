@@ -467,6 +467,10 @@ def get_kitchen_simple(cook_date_str):
 
     today = start.isoformat()
     by_sub = defaultdict(lambda: defaultdict(float))
+    # Clients and meal boxes per day: servings alone don't say how many
+    # people eat it (a side salad of 0.5 is still one box).
+    people_by_sub = defaultdict(lambda: defaultdict(set))
+    boxes_by_sub = defaultdict(lambda: defaultdict(set))
     today_mpdr = defaultdict(set)
     # (subrecipe, user, recipe) delivered today: who to show comments for.
     today_lines = defaultdict(set)
@@ -481,6 +485,8 @@ def get_kitchen_simple(cook_date_str):
             continue
         day = deliv["delivery_date"][:10]
         by_sub[sid][day] += n
+        people_by_sub[sid][day].add(deliv.get("user_id"))
+        boxes_by_sub[sid][day].add(mpdr["id"])
         if day == today:
             today_mpdr[sid].add(mpdr["id"])
             today_lines[sid].add((deliv.get("user_id"), mpdr.get("recipe_id")))
@@ -552,6 +558,8 @@ def get_kitchen_simple(cook_date_str):
             "is_side_salad": is_salad,
             "instructions": sub.get("instructions"),
             "by_date": {d: round(per_day.get(d, 0), 2) for d in dates},
+            "people_by_date": {d: len(people_by_sub[sid].get(d, ())) for d in dates},
+            "boxes_by_date": {d: len(boxes_by_sub[sid].get(d, ())) for d in dates},
             "today_mpdr_ids": sorted(today_mpdr.get(sid, ())),
             "comments": comments,
             "ingredients_per_serving": _scaled_ingredients(sub_ingreds[sid], ingredient_map, 1, digits=4),
