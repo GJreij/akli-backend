@@ -472,8 +472,10 @@ def get_kitchen_simple(cook_date_str):
     people_by_sub = defaultdict(lambda: defaultdict(set))
     boxes_by_sub = defaultdict(lambda: defaultdict(set))
     today_mpdr = defaultdict(set)
-    # (subrecipe, user, recipe) delivered today: who to show comments for.
-    today_lines = defaultdict(set)
+    # (user, recipe) per subrecipe per delivery day: whose comments to show.
+    # Today's are "comments"; later days are "upcoming_comments", for when
+    # the pot cooked today also covers those days.
+    lines_by_day = defaultdict(lambda: defaultdict(set))
     for sv in servings:
         n = sv.get("recipe_subrecipe_serving_calculated") or 0
         sid = sv.get("subrecipe_id")
@@ -487,9 +489,9 @@ def get_kitchen_simple(cook_date_str):
         by_sub[sid][day] += n
         people_by_sub[sid][day].add(deliv.get("user_id"))
         boxes_by_sub[sid][day].add(mpdr["id"])
+        lines_by_day[sid][day].add((deliv.get("user_id"), mpdr.get("recipe_id")))
         if day == today:
             today_mpdr[sid].add(mpdr["id"])
-            today_lines[sid].add((deliv.get("user_id"), mpdr.get("recipe_id")))
 
     sub_ids = list(by_sub.keys())
     subs = {x["id"]: x for x in _fetch_in(
@@ -502,15 +504,16 @@ def get_kitchen_simple(cook_date_str):
         "id", {si["ingredient_id"] for rows in sub_ingreds.values() for si in rows},
     )}
 
-    # Comments, only for clients delivered today.
-    user_ids = list({u for lines in today_lines.values() for u, _ in lines if u})
+    # Comments for every client in the window.
+    all_lines = [ln for days in lines_by_day.values() for lines in days.values() for ln in lines]
+    user_ids = list({u for u, _ in all_lines if u})
     users = {u["id"]: u for u in _fetch_in("user", "id, name, last_name", "id", user_ids)}
 
     def _name(uid):
         u = users.get(uid) or {}
         return f"{(u.get('name') or '').strip()} {(u.get('last_name') or '').strip()}".strip() or "Unknown"
 
-    recipe_ids = {r for lines in today_lines.values() for _, r in lines if r}
+    recipe_ids = {r for _, r in all_lines if r}
     recipes = {r["id"]: r for r in _fetch_in("recipe", "id, name", "id", recipe_ids)}
     recipe_comments = {}
     for p in _fetch_in("user_recipe_preferences", "id, recipe_id, user_id, comment, updated_at", "user_id", user_ids,
@@ -535,22 +538,28 @@ def get_kitchen_simple(cook_date_str):
         if not sub:
             continue
         is_salad = bool(sub.get("is_side_salad"))
-        comments, seen = [], set()
-        for uid, rid in sorted(today_lines.get(sid, ()), key=lambda x: (str(x[0]), x[1] or 0)):
-            text = salad_comments.get((sid, uid)) if is_salad else (recipe_comments.get((rid, uid)) or {}).get("comment")
-            if not text:
-                continue
-            text = text.strip()
-            key = (uid, None if is_salad else rid, text)
-            if key in seen:
-                continue
-            seen.add(key)
-            comments.append({
-                "user_id": uid, "name": _name(uid), "comment": text,
-                "recipe_id": None if is_salad else rid,
-                "recipe_name": None if is_salad else (recipes.get(rid) or {}).get("name"),
-                "instruction": handling.get((uid, 0 if is_salad else (rid or 0), sid, text)),
-            })
+
+        def _comments_for(day):
+            out, seen = [], set()
+            for uid, rid in sorted(lines_by_day[sid].get(day, ()), key=lambda x: (str(x[0]), x[1] or 0)):
+                text = salad_comments.get((sid, uid)) if is_salad else (recipe_comments.get((rid, uid)) or {}).get("comment")
+                if not text:
+                    continue
+                text = text.strip()
+                key = (uid, None if is_salad else rid, text)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({
+                    "user_id": uid, "name": _name(uid), "comment": text,
+                    "recipe_id": None if is_salad else rid,
+                    "recipe_name": None if is_salad else (recipes.get(rid) or {}).get("name"),
+                    "instruction": handling.get((uid, 0 if is_salad else (rid or 0), sid, text)),
+                })
+            return out
+
+        comments = _comments_for(today)
+        upcoming = [dict(c, date=d) for d in dates[1:] for c in _comments_for(d)]
         rows.append({
             "subrecipe_id": sid,
             "name": sub["name"],
@@ -562,6 +571,7 @@ def get_kitchen_simple(cook_date_str):
             "boxes_by_date": {d: len(boxes_by_sub[sid].get(d, ())) for d in dates},
             "today_mpdr_ids": sorted(today_mpdr.get(sid, ())),
             "comments": comments,
+            "upcoming_comments": upcoming,
             "ingredients_per_serving": _scaled_ingredients(sub_ingreds[sid], ingredient_map, 1, digits=4),
         })
     prep_rank = {"cook": 0, "assemble": 1, "slice": 2, "ready": 3}
