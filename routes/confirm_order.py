@@ -2,6 +2,7 @@
 
 from flask import Blueprint, request, jsonify
 from services.order_service import OrderService
+from services.advanced_planning_service import AdvancedPlanningError, normalize_for_confirm
 from utils.event_logger import log_event
 import traceback
 import logging
@@ -59,6 +60,15 @@ def confirm_order():
                 "missing_fields": missing
             }), 400
 
+        # ---- Advanced planning (beta): re-check the rules and rebuild the
+        # hand-edited days' macros from the DB before anything is stored.
+        if isinstance(meal_plan, dict) and meal_plan.get("advanced_planning"):
+            try:
+                meal_plan = normalize_for_confirm(user_id, meal_plan)
+            except AdvancedPlanningError as e:
+                log_event(user_id, "api_error", {"route": "/confirm_order", "status_code": e.status, "reason": "advanced_planning", "message": str(e)})
+                return jsonify({"error": str(e)}), e.status
+
         # ---- Orchestration ----
         result, status_code = order_service.confirm_order(
             user_id=user_id,
@@ -78,6 +88,14 @@ def confirm_order():
                 "delivery_slot_id": delivery_slot_id,
                 "order_id": result.get("order_id") or result.get("id"),
             })
+            if isinstance(meal_plan, dict) and meal_plan.get("advanced_planning"):
+                manual_days = [d for d in meal_plan.get("days") or [] if d.get("manual_servings")]
+                log_event(user_id, "advanced_planning_order_confirmed", {
+                    "order_id": result.get("order_id") or result.get("id"),
+                    "manual_dates": [d.get("date") for d in manual_days],
+                    "total_days": len(meal_plan.get("days") or []),
+                    "price": (checkout_summary.get("price_breakdown") or {}).get("final_price"),
+                })
         else:
             log_event(user_id, "api_error", {"route": "/confirm_order", "status_code": status_code, "error": result.get("error")})
 
