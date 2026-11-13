@@ -15,7 +15,7 @@ def _client_sort_key(client):
 
 def _recipe_sort_key(recipe):
     meal_rank = MEAL_TYPE_ORDER.get((recipe.get("meal_type") or "").lower(), 99)
-    return (meal_rank, (recipe.get("recipe_name") or "").lower())
+    return (recipe.get("eat_date") or "", meal_rank, (recipe.get("recipe_name") or "").lower())
 
 
 def _salad_status(default_ids, actual_ids, subrecipes_by_id):
@@ -90,7 +90,7 @@ def get_packaging_view(start_date, end_date):
     # --- 4. meal_plan_day ---
     mpd_res = (
         supabase.table("meal_plan_day")
-        .select("id, delivery_id, status")
+        .select("id, delivery_id, status, date")
         .in_("delivery_id", list(deliveries_by_id.keys()))
         .execute()
     )
@@ -244,6 +244,11 @@ def get_packaging_view(start_date, end_date):
 
                 packaging_output[d_date][slot_id]["clients"][client_key]["recipes"].append({
                     "meal_plan_day_recipe_id": mpdr_entry["id"],
+                    # The day the client EATS this meal. Usually delivery_date+1,
+                    # but a client can get several days in one bag (several
+                    # deliveries rows on the same night) — the board splits the
+                    # card by this so packers know which box is for which day.
+                    "eat_date": mpd_entry.get("date"),
                     "meal_type": mpdr_entry.get("meal_type"),
                     "recipe_name": recipe_info.get("name") if recipe_info else None,
                     "packaging_status": mpdr_entry.get("packaging_status") or "pending",

@@ -78,10 +78,19 @@ def get_delivery_overview(start_date, end_date):
         for a in addr_res.data or []:
             addresses_by_user.setdefault(a["user_id"], []).append(a)
 
-    # --- 5. Payments (keyed by meal_plan_day_id) ---
+    # --- 5. Payments (keyed by meal_plan_day_id) + the day each delivery's
+    # meals are eaten (several days can share one delivery night) ---
     mpd_ids = list({d["meal_plan_day_id"] for d in deliveries if d.get("meal_plan_day_id")})
     payments_by_mpd = {}
+    eat_date_by_mpd = {}
     if mpd_ids:
+        mpd_res = (
+            supabase.table("meal_plan_day")
+            .select("id, date")
+            .in_("id", mpd_ids)
+            .execute()
+        )
+        eat_date_by_mpd = {m["id"]: m.get("date") for m in (mpd_res.data or [])}
         payments_res = (
             supabase.table("payment")
             .select("meal_plan_day_id, amount, currency, provider, status")
@@ -130,6 +139,7 @@ def get_delivery_overview(start_date, end_date):
         output.append({
             "id": d["id"],
             "delivery_date": d.get("delivery_date"),
+            "eat_date": eat_date_by_mpd.get(d.get("meal_plan_day_id")),
             "status": d.get("status"),
             "delivery_slot": {
                 "id": slot["id"],
