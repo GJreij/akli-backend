@@ -1,6 +1,7 @@
 # services/packaging_service.py
 
 from utils.supabase_client import supabase
+from utils.supabase_paging import fetch_all
 
 # Canonical meal-of-day order, matching the convention used across the
 # client-facing app (labels.ts, OrderHistory.tsx, OrderFlow.tsx) and the
@@ -15,6 +16,32 @@ def _client_sort_key(client):
 def _recipe_sort_key(recipe):
     meal_rank = MEAL_TYPE_ORDER.get((recipe.get("meal_type") or "").lower(), 99)
     return (meal_rank, (recipe.get("recipe_name") or "").lower())
+
+
+def _salad_status(default_ids, actual_ids, subrecipes_by_id):
+    """How this meal's side salad differs from the recipe's standard one.
+
+    None       -> the dish has no salad and none was added (nothing to flag)
+    "standard" -> packed with the recipe's usual salad
+    "removed"  -> the dish normally has a salad but this client gets none
+    "swapped"  -> a different salad than usual (e.g. House Salad fallback)
+    "added"    -> a salad on a dish that normally has none
+    """
+    if not default_ids and not actual_ids:
+        return None
+
+    def names(ids):
+        return ", ".join(sorted((subrecipes_by_id.get(i, {}).get("name") or "?") for i in ids)) or None
+
+    if not actual_ids:
+        status = "removed"
+    elif not default_ids:
+        status = "added"
+    elif actual_ids == default_ids:
+        status = "standard"
+    else:
+        status = "swapped"
+    return {"status": status, "usual": names(default_ids), "packed": names(actual_ids)}
 
 
 def get_packaging_view(start_date, end_date):
@@ -101,30 +128,55 @@ def get_packaging_view(start_date, end_date):
         recipes_by_id = {r["id"]: r for r in (recipes_res.data or [])}
 
     # --- 7. servings (subrecipes) ---
+    # Paged: several components per meal means a multi-day range can pass
+    # PostgREST's 1000-row cap, which would silently drop sides off the board.
     mpdr_ids = [r["id"] for r in mpdr]
-    servings_res = (
+    servings = fetch_all(lambda lo, hi: (
         supabase.table("meal_plan_day_recipe_serving")
-        .select("meal_plan_day_recipe_id, subrecipe_id, recipe_subrecipe_serving_calculated")
+        .select("id, meal_plan_day_recipe_id, subrecipe_id, recipe_subrecipe_serving_calculated")
         .in_("meal_plan_day_recipe_id", mpdr_ids)
-        .execute()
-    )
-    servings = servings_res.data or []
+        .order("id")
+        .range(lo, hi)
+    )) if mpdr_ids else []
 
     servings_by_mpdr = {}
     for s in servings:
         servings_by_mpdr.setdefault(s["meal_plan_day_recipe_id"], []).append(s)
 
+    # --- 7b. each recipe's standard composition, to spot salads that were
+    # removed or swapped for this client (packers pack from memory of the
+    # standard dish, so the difference has to be shouted, not implied).
+    unique_recipe_ids = list(set(recipe_ids))
+    recipe_subs = fetch_all(lambda lo, hi: (
+        supabase.table("recipe_subrecipe")
+        .select("id, recipe_id, subrecipe_id")
+        .in_("recipe_id", unique_recipe_ids)
+        .order("id")
+        .range(lo, hi)
+    )) if unique_recipe_ids else []
+
     # --- 8. subrecipes ---
-    subrecipe_ids = list({s["subrecipe_id"] for s in servings if s.get("subrecipe_id")})
+    subrecipe_ids = list(
+        {s["subrecipe_id"] for s in servings if s.get("subrecipe_id")}
+        | {rs["subrecipe_id"] for rs in recipe_subs if rs.get("subrecipe_id")}
+    )
     subrecipes_by_id = {}
     if subrecipe_ids:
         subrecipes_res = (
             supabase.table("subrecipe")
-            .select("id, name")
+            .select("id, name, is_side_salad")
             .in_("id", subrecipe_ids)
             .execute()
         )
         subrecipes_by_id = {s["id"]: s for s in (subrecipes_res.data or [])}
+
+    def _is_salad(sub_id):
+        return bool(subrecipes_by_id.get(sub_id, {}).get("is_side_salad"))
+
+    default_salads_by_recipe = {}
+    for rs in recipe_subs:
+        if _is_salad(rs["subrecipe_id"]):
+            default_salads_by_recipe.setdefault(rs["recipe_id"], set()).add(rs["subrecipe_id"])
 
     # -------------------------------------------------------------------------
     # ------------------------- GROUPING STARTS HERE ---------------------------
@@ -186,7 +238,8 @@ def get_packaging_view(start_date, end_date):
                     subs.append({
                         "subrecipe_id": serv["subrecipe_id"],
                         "subrecipe_name": subrecipes_by_id.get(serv["subrecipe_id"], {}).get("name"),
-                        "serving_size": serv["recipe_subrecipe_serving_calculated"]
+                        "serving_size": serv["recipe_subrecipe_serving_calculated"],
+                        "is_side_salad": _is_salad(serv["subrecipe_id"]),
                     })
 
                 packaging_output[d_date][slot_id]["clients"][client_key]["recipes"].append({
@@ -195,7 +248,12 @@ def get_packaging_view(start_date, end_date):
                     "recipe_name": recipe_info.get("name") if recipe_info else None,
                     "packaging_status": mpdr_entry.get("packaging_status") or "pending",
                     "is_swapped": bool(mpdr_entry.get("is_swapped")),
-                    "subrecipes": subs
+                    "subrecipes": subs,
+                    "salad": _salad_status(
+                        default_salads_by_recipe.get(mpdr_entry["recipe_id"], set()),
+                        {s["subrecipe_id"] for s in subs if s["is_side_salad"]},
+                        subrecipes_by_id,
+                    ),
                 })
 
     # -------------------------------------------------------------------------
