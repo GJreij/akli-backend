@@ -472,6 +472,11 @@ def get_kitchen_simple(cook_date_str):
     people_by_sub = defaultdict(lambda: defaultdict(set))
     boxes_by_sub = defaultdict(lambda: defaultdict(set))
     today_mpdr = defaultdict(set)
+    # Meal ids per subrecipe per day, so several days can be portioned at once.
+    mpdr_by_day = defaultdict(lambda: defaultdict(set))
+    # Servings per (user, recipe) per subrecipe per day: shown next to a
+    # client's note so the cook knows how much that person's portion is.
+    line_servings = defaultdict(float)
     # (user, recipe) per subrecipe per delivery day: whose comments to show.
     # Today's are "comments"; later days are "upcoming_comments", for when
     # the pot cooked today also covers those days.
@@ -490,6 +495,8 @@ def get_kitchen_simple(cook_date_str):
         people_by_sub[sid][day].add(deliv.get("user_id"))
         boxes_by_sub[sid][day].add(mpdr["id"])
         lines_by_day[sid][day].add((deliv.get("user_id"), mpdr.get("recipe_id")))
+        line_servings[(sid, day, deliv.get("user_id"), mpdr.get("recipe_id"))] += n
+        mpdr_by_day[sid][day].add(mpdr["id"])
         if day == today:
             today_mpdr[sid].add(mpdr["id"])
 
@@ -540,22 +547,26 @@ def get_kitchen_simple(cook_date_str):
         is_salad = bool(sub.get("is_side_salad"))
 
         def _comments_for(day):
-            out, seen = [], set()
+            out, by_key = [], {}
             for uid, rid in sorted(lines_by_day[sid].get(day, ()), key=lambda x: (str(x[0]), x[1] or 0)):
                 text = salad_comments.get((sid, uid)) if is_salad else (recipe_comments.get((rid, uid)) or {}).get("comment")
                 if not text:
                     continue
                 text = text.strip()
                 key = (uid, None if is_salad else rid, text)
-                if key in seen:
+                n = line_servings.get((sid, day, uid, rid), 0)
+                if key in by_key:
+                    # Same note, another meal (e.g. a salad on lunch and dinner).
+                    by_key[key]["servings"] = round(by_key[key]["servings"] + n, 2)
                     continue
-                seen.add(key)
-                out.append({
+                by_key[key] = {
                     "user_id": uid, "name": _name(uid), "comment": text,
                     "recipe_id": None if is_salad else rid,
                     "recipe_name": None if is_salad else (recipes.get(rid) or {}).get("name"),
                     "instruction": handling.get((uid, 0 if is_salad else (rid or 0), sid, text)),
-                })
+                    "servings": round(n, 2),
+                }
+                out.append(by_key[key])
             return out
 
         comments = _comments_for(today)
@@ -570,6 +581,7 @@ def get_kitchen_simple(cook_date_str):
             "people_by_date": {d: len(people_by_sub[sid].get(d, ())) for d in dates},
             "boxes_by_date": {d: len(boxes_by_sub[sid].get(d, ())) for d in dates},
             "today_mpdr_ids": sorted(today_mpdr.get(sid, ())),
+            "mpdr_ids_by_date": {d: sorted(mpdr_by_day[sid].get(d, ())) for d in dates},
             "comments": comments,
             "upcoming_comments": upcoming,
             "ingredients_per_serving": _scaled_ingredients(sub_ingreds[sid], ingredient_map, 1, digits=4),
