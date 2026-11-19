@@ -1,0 +1,78 @@
+{
+ "actual": {
+  "meals": 677,
+  "cook_days": 10,
+  "batches": 172,
+  "avg_portions_per_batch": 3.94,
+  "single_portion_batches": 34,
+  "batches_le2": 63,
+  "pct_meals_in_batches_ge5": 0.575,
+  "distinct_recipes_per_day": 17.2,
+  "cook_days_per_recipe_wk": 2.77,
+  "avg_distinct_ratio_per_client": 0.814,
+  "max_same_recipe_per_client_avg": 2.1,
+  "pct_days_repeating_yesterday": 0.252,
+  "top_singles": [
+   [
+    "Apple Cinnamon Baked Oats",
+    2
+   ],
+   [
+    "Grilled Chicken, Quinoa & Vegetables",
+    2
+   ],
+   [
+    "Ariche with Avocado & Nuts",
+    2
+   ],
+   [
+    "Parsley Tahini Tuna",
+    2
+   ],
+   [
+    "Chicken Fasolya in Tomato Sauce",
+    2
+   ]
+  ]
+ },
+ "prod#0": {
+  "meals": 689,
+  "cook_days": 10,
+  "batches": 96,
+  "avg_portions_per_batch": 7.18,
+  "single_portion_batches": 35,
+  "batches_le2": 52,
+  "pct_meals_in_batches_ge5": 0.877,
+  "distinct_recipes_per_day": 9.6,
+  "cook_days_per_recipe_wk": 1.85,
+  "avg_distinct_ratio_per_client": 0.852,
+  "max_same_recipe_per_client_avg": 1.71,
+  "pct_days_repeating_yesterday": 0.0,
+  "template_match": 0.84,
+  "mean_kcal_dev": 0.0402,
+  "pct_days_off_target": 0.221,
+  "top_singles": [
+   [
+    "Grilled Chicken, Quinoa & Vegetables",
+    3
+   ],
+   [
+    "Siyadiye",
+    3
+   ],
+   [
+    "Pesto Meat & Rice Bowl",
+    2
+   ],
+   [
+    "Chicken Fasolya in Tomato Sauce",
+    2
+   ],
+   [
+    "Kafta with Potatoes in Tomato Sauce",
+    2
+   ]
+  ],
+  "fails": 0
+ }
+}

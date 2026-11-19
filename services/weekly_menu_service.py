@@ -4,6 +4,14 @@ from utils.supabase_client import supabase
 from datetime import datetime
 
 
+def available_on(available_dates, date_str: str) -> bool:
+    """weekly_menu_recipe.available_dates rule: NULL/empty means every day
+    of the menu, otherwise only the listed dates (YYYY-MM-DD)."""
+    if not available_dates:
+        return True
+    return str(date_str)[:10] in {str(d)[:10] for d in available_dates}
+
+
 class WeeklyMenuService:
     def __init__(self):
         self.sb = supabase
@@ -48,10 +56,12 @@ class WeeklyMenuService:
 
         weekly_menu_ids = [m["id"] for m in menus if m.get("id")]
 
-        # 3) Fetch recipes linked to those menus
+        # 3) Fetch recipes linked to those menus, keeping only those
+        #    available on this exact date (available_dates NULL/empty =
+        #    every day of the menu).
         recipe_res = (
             self.sb.table("weekly_menu_recipe")
-            .select("recipe_id")
+            .select("recipe_id, available_dates")
             .in_("weekly_menu_id", weekly_menu_ids)
             .execute()
         )
@@ -61,7 +71,7 @@ class WeeklyMenuService:
         recipe_ids = sorted({
             r["recipe_id"]
             for r in rows
-            if r.get("recipe_id") is not None
+            if r.get("recipe_id") is not None and available_on(r.get("available_dates"), date_str)
         })
 
         return {

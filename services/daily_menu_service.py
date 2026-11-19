@@ -18,10 +18,12 @@ Three layers, in order:
      batching + quality-ranked, cooldown-spaced scheduling). No personal
      like/dislike bias here — this is shared across every client on the
      same kitchen date. Reuses/extends existing daily_menu rows within
-     TEMPLATE_TTL_DAYS; only generates for dates missing a valid one.
+     TEMPLATE_TTL_DAYS (indefinitely once other clients have ordered on
+     that date); only generates for dates missing a valid one.
   2. apply_client_overrides() - per-CLIENT swap of disliked/excluded/
      missing/self-colliding slots. This is where personal preference
-     enters.
+     enters; swaps lean toward recipes already being cooked that day
+     (BATCH_BONUS).
   3. repair_day_if_needed()  - single bounded repair step + substitution
      advisory, called from the route's day loop (after optimize_subrecipes,
      since carryover-adjusted targets are only known there).
@@ -65,6 +67,18 @@ POPULARITY_CAP = 50
 
 TEMPLATE_TTL_DAYS   = 7
 HIGH_KCAL_THRESHOLD = 2800
+
+# Kitchen batching (2026-11-19). Replay of 49 real plans (Nov 9-20, 689
+# meals) through this module: 133 -> 98 recipe-day batches, avg 5.2 -> 7.0
+# portions, kcal fit unchanged, per-client distinct-dish share 91% -> 86%.
+# SAME_DAY_SLOT_MERGE: see build_week_templates. BATCH_BONUS: score added
+# to a swap candidate already being cooked that day (scaled up to
+# BATCH_FULL portions) — equal to one REPEAT_PENALTY, so it decides
+# near-ties but never beats an extra repeat for this client. 3.0 was
+# tested too: fewer batches but worse variety and macro fit.
+SAME_DAY_SLOT_MERGE = False
+BATCH_BONUS = 1.5
+BATCH_FULL  = 3
 
 # Kept for reference/logging only — not used as the repair trigger.
 REPAIRABLE_TIERS = ("BEST_EFFORT_LP", "SAFE_FALLBACK")
@@ -326,7 +340,7 @@ def fetch_other_orders_by_date(
     try:
         days_rows = fetch_all(lambda lo, hi: (
             supabase.table("meal_plan_day")
-            .select("id, date, meal_plan(user_id)")
+            .select("id, date, status, meal_plan(user_id)")
             .in_("date", date_strs)
             .order("id")
             .range(lo, hi)
@@ -336,6 +350,10 @@ def fetch_other_orders_by_date(
 
     day_id_to_date_user: Dict[int, Tuple[date_cls, str]] = {}
     for row in days_rows:
+        # Cancelled days aren't cooked — counting them made a cancelled
+        # order look like kitchen demand (and keeps a stale template alive).
+        if (row.get("status") or "") == "cancelled":
+            continue
         mp = row.get("meal_plan") or {}
         uid = mp.get("user_id")
         if uid == exclude_user_id or not uid:
@@ -504,6 +522,7 @@ def _rank_and_schedule(
     meals_map: dict, eligible_by_meal_type: dict, flex_stats: dict, popularity: dict,
     recipe_macros: dict, reference_target: dict, dates: List[date_cls],
     preexisting: Dict[date_cls, Dict[str, int]],
+    allowed_by_date: Dict[date_cls, set] | None = None,
 ) -> Dict[date_cls, Dict[str, int]]:
     """Returns {date: {meal_key: recipe_id}} for every date in `dates`
     (both pre-existing, passed through unchanged, and newly scheduled).
@@ -584,10 +603,18 @@ def _rank_and_schedule(
                 return rid
         return None
 
+    # Recipes on the segment's menu but not available on a given date
+    # (weekly_menu_recipe.available_dates) are excluded on that date only.
+    seg_pool = {rid for ids in eligible_by_meal_type.values() for rid in ids}
+
     result: Dict[date_cls, Dict[str, int]] = {}
     for day_idx, day in enumerate(dates):
         existing_today = preexisting.get(day, {})
-        used_today: set = set(existing_today.values())
+        blocked_today: set = (
+            seg_pool - allowed_by_date[day]
+            if allowed_by_date is not None and day in allowed_by_date else set()
+        )
+        used_today: set = set(existing_today.values()) | blocked_today
         chosen_by_meal: dict = dict(existing_today)
         prev_day_map = result[dates[day_idx - 1]] if day_idx > 0 else {}
 
@@ -635,6 +662,20 @@ def _rank_and_schedule(
         result[day] = chosen_by_meal
 
     return result
+
+
+def _segment_key(d: date_cls, allowed_recipe_ids_by_date: Dict[date_cls, set],
+                 menu_id_by_date: Dict[date_cls, int] | None):
+    """Dates sharing a key are scheduled together. By weekly_menu when
+    known: per-dish available_dates make the exact pool differ day to day,
+    and segmenting by exact pool then turned every day into its own
+    1-day segment — no day-to-day spacing, the same top recipe picked
+    daily, and clients swapped off it by the no-yesterday rule (replay
+    2026-11-19: 115 batches vs 96 without availability limits)."""
+    if menu_id_by_date and d in menu_id_by_date:
+        return ("menu", menu_id_by_date[d])
+    allowed = allowed_recipe_ids_by_date.get(d)
+    return ("pool", frozenset(allowed) if allowed else frozenset())
 
 
 def _apply_kitchen_batching(
@@ -737,6 +778,7 @@ def build_week_templates(
     recipe_macros: dict,
     reference_target: dict,
     other_orders: Dict[date_cls, Dict[str, Dict[int, int]]] | None = None,
+    menu_id_by_date: Dict[date_cls, int] | None = None,
 ) -> Dict[date_cls, Dict[str, dict]]:
     """Builds/reuses the SHARED (cross-client) daily_menu template for
     every date in available_dates, scoped strictly to `meals_map`.
@@ -784,7 +826,15 @@ def build_week_templates(
         # this date is stale, treat the whole date as missing so it gets
         # regenerated (avoids a half-stale/half-fresh template).
         valid = {mt: r for mt, r in rows.items() if mt in requested_meal_types}
-        if valid:
+        # Once other clients have CONFIRMED orders on a date, its template
+        # is what the kitchen is batching around — keep it however old it
+        # is. Confirmed bug (2026-11-19): every November template was
+        # written Oct 16-21, went past the TTL, and was then regenerated
+        # privately per request (the persist below used to ignore
+        # duplicates), so no two later clients shared a template. A
+        # replay of real Nov 9-20 orders showed fewer cooking batches
+        # with templates kept stable.
+        if valid and not (other_orders or {}).get(d):
             try:
                 oldest = min(
                     datetime.strptime(r["created_at"][:19], "%Y-%m-%dT%H:%M:%S")
@@ -863,13 +913,12 @@ def build_week_templates(
         # could get a week-N recipe assigned to a week-N+1 date. Confirmed
         # via real data on 2026-08-18: weekly_menu 27 and 28 (adjacent,
         # both currently active) share only 2 of 18 recipes.
-        def _pool_signature(d: date_cls) -> frozenset:
-            allowed = allowed_recipe_ids_by_date.get(d)
-            return frozenset(allowed) if allowed else frozenset()
+        def _key(d: date_cls):
+            return _segment_key(d, allowed_recipe_ids_by_date, menu_id_by_date)
 
         segments: List[List[date_cls]] = []
         for d in available_dates:
-            if segments and _pool_signature(segments[-1][-1]) == _pool_signature(d):
+            if segments and _key(segments[-1][-1]) == _key(d):
                 segments[-1].append(d)
             else:
                 segments.append([d])
@@ -877,7 +926,9 @@ def build_week_templates(
         for seg_dates in segments:
             if not any(d in missing_dates for d in seg_dates):
                 continue
-            allowed_seg = allowed_recipe_ids_by_date.get(seg_dates[0])
+            # Segment pool = every recipe available on ANY of its dates;
+            # _rank_and_schedule then blocks each one on dates it isn't on.
+            allowed_seg = set().union(*(allowed_recipe_ids_by_date.get(d) or set() for d in seg_dates))
             if allowed_seg:
                 eligible_seg = {
                     mt: [rid for rid in ids if rid in allowed_seg]
@@ -888,27 +939,43 @@ def build_week_templates(
             seg_result = _rank_and_schedule(
                 meals_map, eligible_seg, flex_stats, popularity,
                 recipe_macros, reference_target, seg_dates, seed,
+                allowed_by_date={d: allowed_recipe_ids_by_date[d] for d in seg_dates
+                                 if allowed_recipe_ids_by_date.get(d)},
             )
             for d in seg_dates:
                 seed[d] = seg_result[d]
 
-        schedule = _apply_kitchen_batching(
-            seed, meals_map, dict(eligible_by_meal_type), recipe_macros,
-            reference_target, mutable_dates=set(missing_dates),
-            allowed_recipe_ids_by_date=allowed_recipe_ids_by_date,
-            locked_slots=locked_slots,
-        )
+        # The same-day slot merge (_apply_kitchen_batching: e.g. lunch ==
+        # dinner) is off. Most clients order both slots, and
+        # apply_client_overrides never allows the same recipe twice on one
+        # day, so a merged slot was swapped away for nearly everyone and
+        # just scattered those clients across the menu.
+        if SAME_DAY_SLOT_MERGE:
+            schedule = _apply_kitchen_batching(
+                seed, meals_map, dict(eligible_by_meal_type), recipe_macros,
+                reference_target, mutable_dates=set(missing_dates),
+                allowed_recipe_ids_by_date=allowed_recipe_ids_by_date,
+                locked_slots=locked_slots,
+            )
+        else:
+            schedule = {d: dict(chosen) for d, chosen in seed.items()}
 
-        # Persist only newly-decided dates (never touch preexisting ones).
+        # Persist newly-decided dates. Overwrite (not ignore) existing rows:
+        # a date only lands in missing_dates with rows present when they
+        # were stale and nobody else has ordered on it yet, and a fresh
+        # created_at restarts its TTL. Previously-committed slots on a
+        # partial date are unchanged by scheduling, so rewriting them is a
+        # no-op apart from the timestamp.
+        now_iso = datetime.utcnow().isoformat()
         upsert_rows = []
         for d in missing_dates:
             for mk, mt in meals_map.items():
                 rid = schedule[d].get(mk)
                 if rid is not None:
-                    upsert_rows.append({"date": str(d), "meal_type": mt, "recipe_id": rid})
+                    upsert_rows.append({"date": str(d), "meal_type": mt, "recipe_id": rid, "created_at": now_iso})
         if upsert_rows:
             supabase.table("daily_menu").upsert(
-                upsert_rows, on_conflict="date,meal_type", ignore_duplicates=True,
+                upsert_rows, on_conflict="date,meal_type",
             ).execute()
     else:
         schedule = {d: dict(preexisting.get(d, {})) for d in available_dates}
@@ -941,10 +1008,14 @@ def _client_candidates(
     meal_type: str, allowed_ids_today: set, used_today: set, exclude: set,
     user_prefs: dict, recipe_lookup: dict, recipe_macros: dict, macro_target: dict,
     plan_counts: Dict[int, int],
+    batch_counts: Dict[int, int] | None = None,
 ) -> List[Tuple[int, float]]:
     """(rid, effective_score) for every recipe this client could eat in
     this slot today. effective = macro fit + like/dislike bias - a penalty
-    per time this client already has the recipe ANYWHERE in the plan."""
+    per time this client already has the recipe ANYWHERE in the plan + a
+    kitchen bonus when the recipe is already being cooked that day
+    (`batch_counts`, see build_batch_counts)."""
+    batch_counts = batch_counts or {}
     pairs = []
     for rid in allowed_ids_today:
         recipe = recipe_lookup.get(rid)
@@ -962,8 +1033,58 @@ def _client_candidates(
             base += 2.0
         if pref.get("dislike"):
             base -= 5.0
+        base += BATCH_BONUS * min(1.0, batch_counts.get(rid, 0) / BATCH_FULL)
         pairs.append((rid, base - REPEAT_PENALTY * plan_counts.get(rid, 0)))
     return pairs
+
+
+CHEFS_PICK_MIN_CLIENTS = 3
+CHEFS_PICK_GROUPS = {"breakfast": "breakfast", "lunch": "main", "dinner": "main", "snack": "snack"}
+
+
+def chefs_picks_by_date(dates: List[date_cls]) -> Dict[date_cls, Dict[str, int]]:
+    """{date: {group: recipe_id}} — per meal group ("breakfast", "main" =
+    lunch+dinner, "snack"), the recipe with the most distinct clients
+    ordered on that date so far, once it has at least
+    CHEFS_PICK_MIN_CLIENTS. Ties go to the lower recipe id so the badge
+    doesn't flicker between page loads."""
+    orders = fetch_other_orders_by_date(dates, exclude_user_id=None)
+    out: Dict[date_cls, Dict[str, int]] = {}
+    for d, by_mt in orders.items():
+        totals: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        for mt, by_rid in by_mt.items():
+            group = CHEFS_PICK_GROUPS.get(mt)
+            if not group:
+                continue
+            for rid, n in by_rid.items():
+                totals[group][rid] += n
+        day = {}
+        for group, counts in totals.items():
+            rid, n = min(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            if n >= CHEFS_PICK_MIN_CLIENTS:
+                day[group] = rid
+        if day:
+            out[d] = day
+    return out
+
+
+def build_batch_counts(
+    other_orders_for_date: Dict[str, Dict[int, int]] | None,
+    template_for_date: Dict[str, dict] | None,
+) -> Dict[int, int]:
+    """{recipe_id: portions already being cooked that day} — other
+    clients' confirmed orders summed across meal types (a dinner batch is
+    the same pot as a lunch batch), with the day's shared template picks
+    counted as full batches since most clients will follow them."""
+    counts: Dict[int, int] = defaultdict(int)
+    for by_rid in (other_orders_for_date or {}).values():
+        for rid, n in by_rid.items():
+            counts[rid] += n
+    for info in (template_for_date or {}).values():
+        rid = info.get("recipe_id")
+        if rid is not None:
+            counts[rid] = max(counts[rid], BATCH_FULL)
+    return dict(counts)
 
 
 def _pick_varied(pairs: List[Tuple[int, float]], rng: random.Random) -> int:
@@ -985,6 +1106,7 @@ def apply_client_overrides(
     plan_counts: Dict[int, int] | None = None,
     previous_day_recipes: set | None = None,
     rng: random.Random | None = None,
+    batch_counts: Dict[int, int] | None = None,
 ) -> Dict[str, dict] | None:
     """Per-CLIENT layer on top of the shared template. A template slot is
     kept (preserving kitchen batching) unless, for THIS client, it is
@@ -1012,7 +1134,7 @@ def apply_client_overrides(
     def cands(meal_type: str, exclude: set) -> List[Tuple[int, float]]:
         return _client_candidates(
             meal_type, allowed_ids_today, used_today, exclude, user_prefs,
-            recipe_lookup, recipe_macros, macro_target, plan_counts,
+            recipe_lookup, recipe_macros, macro_target, plan_counts, batch_counts,
         )
 
     for meal_key, meal_type in meals_map.items():

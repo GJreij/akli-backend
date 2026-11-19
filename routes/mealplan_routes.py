@@ -11,6 +11,7 @@ from services.mealplan_service import (
     side_salad_options,
 )
 from services import daily_menu_service as dms
+from services.weekly_menu_service import available_on
 from utils.event_logger import log_event
 
 mealplan_bp = Blueprint("mealplan", __name__)
@@ -189,7 +190,7 @@ def generate_meal_plan():
     # ------------------------------------------------------------------
     weekly_menus = (
         supabase.table("weekly_menu")
-        .select("id, week_start_date, week_end_date, weekly_menu_recipe(recipe(*))")
+        .select("id, week_start_date, week_end_date, weekly_menu_recipe(available_dates, recipe(*))")
         .lte("week_start_date", str(end_date))
         .gte("week_end_date",   str(start_date))
         .execute()
@@ -199,6 +200,9 @@ def generate_meal_plan():
         return jsonify({"error": "No weekly menus found for this date range"}), 404
 
     allowed_recipe_ids_by_date: dict = defaultdict(set)
+    # Which weekly_menu covers each date — the shared template is scheduled
+    # per menu period, with per-dish available_dates applied day by day.
+    menu_id_by_date: dict = {}
     recipes_by_id: dict = {}
 
     for wm in weekly_menus:
@@ -207,6 +211,8 @@ def generate_meal_plan():
             we = _parse_date(wm["week_end_date"])
         except Exception:
             continue
+        for d in _daterange(ws, we):
+            menu_id_by_date.setdefault(d, wm["id"])
         for wmr in (wm.get("weekly_menu_recipe") or []):
             recipe = (wmr or {}).get("recipe")
             if not recipe or not recipe.get("id"):
@@ -214,7 +220,9 @@ def generate_meal_plan():
             rid = recipe["id"]
             recipes_by_id[rid] = recipe
             for d in _daterange(ws, we):
-                allowed_recipe_ids_by_date[d].add(rid)
+                # available_dates NULL/empty = every day of this menu
+                if available_on(wmr.get("available_dates"), str(d)):
+                    allowed_recipe_ids_by_date[d].add(rid)
 
     all_recipes = list(recipes_by_id.values())
     if not all_recipes:
@@ -310,6 +318,7 @@ def generate_meal_plan():
         recipe_macros=recipe_macros,
         reference_target=reference_target,
         other_orders=other_orders,
+        menu_id_by_date=menu_id_by_date,
     )
 
     # ------------------------------------------------------------------
@@ -376,6 +385,8 @@ def generate_meal_plan():
             plan_counts=plan_counts,
             previous_day_recipes=previous_day_recipes,
             rng=rng,
+            # Swaps lean toward what the kitchen already cooks that day.
+            batch_counts=dms.build_batch_counts(other_orders.get(date), template_for_date),
         )
 
         if not recipes_by_meal:

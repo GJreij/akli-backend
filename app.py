@@ -17,6 +17,7 @@ from routes.meal_swap_routes import meal_swap_bp
 from routes.day_edit_routes import day_edit_bp
 from routes.kitchen import kitchen_bp
 from routes.advanced_planning import advanced_planning_bp
+from routes.chefs_pick_routes import chefs_pick_bp
 import os
 
 app = Flask(__name__)
@@ -40,6 +41,7 @@ app.register_blueprint(meal_swap_bp)
 app.register_blueprint(day_edit_bp)
 app.register_blueprint(kitchen_bp)
 app.register_blueprint(advanced_planning_bp)
+app.register_blueprint(chefs_pick_bp)
 
 @app.route("/")
 def home():
