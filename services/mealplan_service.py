@@ -192,6 +192,125 @@ RELAXED_DINNER_LUNCH_DIFF_PCT  = 0.60   # |dinner - lunch| / smaller <= 60 %
 # most subrecipes have none and are bounded only by the is_main relationship.
 MAIN_RATIO = 2.5
 
+# =============================================================================
+# CLIENT MEAL SIZES ("Shape your day", advanced planning v2 — experiment)
+# The client picks Light / Normal / Big per meal type. That becomes a target
+# kcal SHARE per meal type (the day's total target never changes — calories
+# only move between meals). The share is a soft goal in the objective; when
+# it's set, the default culinary distribution rules are dropped because the
+# client explicitly asked for a different shape.
+# =============================================================================
+MEAL_BASE_SHARE = {"breakfast": 0.25, "lunch": 0.35, "dinner": 0.30, "snack": 0.10}
+MEAL_SIZE_FACTOR = {"light": 0.65, "normal": 1.0, "big": 1.45}
+WEIGHT_USER_SHAPE = 2.0
+# A meal the client changed that lands this far from its goal is reported as
+# "not possible" — never below the absolute floors, so a small wobble on a
+# small meal isn't flagged.
+MEAL_SHAPE_MISS_PCT = 0.20
+MEAL_SHAPE_MISS_FLOOR = {"kcal": 120, "protein": 10, "carbs": 15, "fat": 8}
+_MACRO_KCAL = {"protein": 4, "carbs": 4, "fat": 9}
+
+
+def _meal_mode(v) -> str:
+    """'light' | 'normal' | 'big' | 'pct' | 'exact' for one meal's setting.
+    A setting is either a size string, {"pct": 40}, or exact grams/kcal
+    {"kcal"?, "protein"?, "carbs"?, "fat"?}."""
+    if isinstance(v, str):
+        return v if v in MEAL_SIZE_FACTOR else "normal"
+    if isinstance(v, dict):
+        if v.get("pct") is not None:
+            return "pct"
+        if any(v.get(k) is not None for k in ("kcal", "protein", "carbs", "fat")):
+            return "exact"
+    return "normal"
+
+
+def resolve_meal_goals(
+    meal_sizes: Dict[str, Any] | None, present_types, day_kcal: float
+) -> Dict[str, Dict[str, Any]] | None:
+    """Client meal settings -> absolute goals per present meal type:
+    {type: {"kcal": x, "protein"?: g, "carbs"?: g, "fat"?: g, "mode": ...}}.
+    Exact and % meals are fixed first; the calories left over are split
+    between the remaining meals by base share x Light/Normal/Big factor.
+    None when nothing is set or the day has fewer than 2 meal types."""
+    types = [t for t in MEAL_BASE_SHARE if t in set(present_types)]
+    if not meal_sizes or len(types) < 2 or day_kcal <= 0:
+        return None
+    modes = {t: _meal_mode(meal_sizes.get(t)) for t in types}
+    if all(m == "normal" for m in modes.values()):
+        return None
+    goals: Dict[str, Dict[str, Any]] = {}
+    fixed_kcal = 0.0
+    for t in types:
+        v, m = meal_sizes.get(t), modes[t]
+        if m == "pct":
+            k = max(0.0, float(v["pct"])) / 100.0 * day_kcal
+            goals[t] = {"kcal": k, "mode": m}
+            fixed_kcal += k
+        elif m == "exact":
+            g = {k2: float(v[k2]) for k2 in ("protein", "carbs", "fat") if v.get(k2) is not None}
+            if v.get("kcal") is not None:
+                k = float(v["kcal"])
+            elif len(g) == 3:
+                k = sum(g[x] * _MACRO_KCAL[x] for x in g)
+            else:
+                # Only some macros set (e.g. "40 g protein"): those are
+                # goals, but the meal's calories come from the shared split.
+                goals[t] = {**g, "mode": m}
+                continue
+            goals[t] = {"kcal": k, **g, "mode": m}
+            fixed_kcal += k
+    rest = [t for t in types if "kcal" not in goals.get(t, {})]
+    if rest:
+        left = max(0.0, day_kcal - fixed_kcal)
+        raw = {t: MEAL_BASE_SHARE[t] * MEAL_SIZE_FACTOR.get(modes[t], 1.0) for t in rest}
+        tot = sum(raw.values()) or 1.0
+        for t in rest:
+            goals.setdefault(t, {"mode": modes[t]})["kcal"] = left * raw[t] / tot
+    return goals
+
+
+def meal_shape_report(
+    meal_sizes: Dict[str, Any] | None,
+    meals: List[Dict[str, Any]],
+    day_kcal_target: float,
+) -> List[Dict[str, Any]] | None:
+    """Per meal: its mode, goals vs what the plan gives (kcal + any exact
+    macros), and whether a meal the client changed missed. meals: the day's
+    meals_list entries (meal_type + macros)."""
+    goals = resolve_meal_goals(meal_sizes, {m["meal_type"] for m in meals}, day_kcal_target)
+    if not goals:
+        return None
+    got: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for m in meals:
+        for k in ("kcal", "protein", "carbs", "fat"):
+            got[m["meal_type"]][k] += (m.get("macros") or {}).get(k, 0) or 0
+    out = []
+    for t, g in goals.items():
+        checks = {k: g[k] for k in ("kcal", "protein", "carbs", "fat") if k in g}
+        # Exact meals are judged only on what the client typed in.
+        judged = (
+            {k: checks[k] for k in ("kcal", "protein", "carbs", "fat")
+             if k in checks and (meal_sizes.get(t) or {}).get(k) is not None}
+            if g["mode"] == "exact" else {"kcal": checks["kcal"]}
+        )
+        ok = True
+        if g["mode"] != "normal":
+            for k, target in judged.items():
+                allowed = max(MEAL_SHAPE_MISS_PCT * target, MEAL_SHAPE_MISS_FLOOR[k])
+                if abs(got[t][k] - target) > allowed:
+                    ok = False
+        out.append({
+            "meal_type": t,
+            "size": g["mode"],
+            "target_kcal": int(round(g["kcal"])),
+            "kcal": int(round(got[t]["kcal"])),
+            "targets": {k: int(round(v)) for k, v in checks.items()},
+            "actual": {k: int(round(got[t][k])) for k in checks},
+            "ok": ok,
+        })
+    return out
+
 
 # =============================================================================
 # DATA FETCHING
@@ -654,6 +773,7 @@ def _solve_lp_once(
     flat_fee: float = 0.0,
     reference_servings: Dict[int, float] | None = None,
     max_movement_pct: float | None = None,
+    meal_goals: Dict[str, Dict[str, Any]] | None = None,
 ) -> Tuple[List[Dict], float, Dict] | None:
     """
     Build and solve one LP instance.
@@ -914,6 +1034,34 @@ def _solve_lp_once(
         prob += kcal_by_type["breakfast"] - kcal_by_type["dinner"] <= dev_breakfast_v_bigger
 
     # ------------------------------------------------------------------
+    # Client meal sizes (advanced planning v2): soft |meal kcal - share x
+    # day kcal| per meal type. Measured against the fixed kcal_t (not the
+    # solved total) so it stays linear. When set, the client's shape
+    # replaces the default culinary shape rules (soft terms here, hard
+    # caps further down) — they asked for that shape explicitly.
+    # ------------------------------------------------------------------
+    user_shape = bool(meal_goals)
+    dev_user_shape = []
+    if user_shape:
+        _expr_by_type = {"kcal": kcal_by_type, "protein": defaultdict(int), "carbs": defaultdict(int), "fat": defaultdict(int)}
+        for i, s_ in enumerate(all_subs):
+            _mt = recipes_by_meal.get(s_["meal"], {}).get("meal_type")
+            if _mt:
+                for _k in ("protein", "carbs", "fat"):
+                    _expr_by_type[_k][_mt] = _expr_by_type[_k][_mt] + servings_expr[i] * s_["macros"][_k]
+        _norm = {"kcal": max(kcal_t, 1.0), "protein": max(P_t, 1.0), "carbs": max(C_t, 1.0), "fat": max(F_t, 1.0)}
+        for _t, _g in meal_goals.items():
+            if _t not in kcal_by_type:
+                continue
+            for _k in ("kcal", "protein", "carbs", "fat"):
+                if _k not in _g:
+                    continue
+                _d = LpVariable(f"dev_shape_{_t}_{_k}", lowBound=0)
+                prob += _expr_by_type[_k][_t] - _g[_k] <= _d
+                prob += _g[_k] - _expr_by_type[_k][_t] <= _d
+                dev_user_shape.append(_d * (1.0 / _norm[_k]))
+
+    # ------------------------------------------------------------------
     # Objective: percentage-normalised macro deviations + soft kcal
     # penalty + soft meal-shape penalty
     # ------------------------------------------------------------------
@@ -922,14 +1070,16 @@ def _solve_lp_once(
     safe_F = max(F_t, 1.0)
     safe_K = max(kcal_t, 1.0)
 
+    _default_shape_w = 0.0 if user_shape else WEIGHT_MEAL_SHAPE_SOFT
     prob += (
         WEIGHT_PROTEIN     * (dev_P / safe_P)
         + WEIGHT_CARBS     * (dev_C / safe_C)
         + WEIGHT_FAT       * (dev_F / safe_F)
         + WEIGHT_KCAL_SOFT * (dev_K / safe_K)
-        + WEIGHT_MEAL_SHAPE_SOFT * (dev_snack_v_lunch / safe_K)
-        + WEIGHT_MEAL_SHAPE_SOFT * (dev_snack_v_dinner / safe_K)
-        + WEIGHT_MEAL_SHAPE_SOFT * (dev_breakfast_v_bigger / safe_K)
+        + _default_shape_w * (dev_snack_v_lunch / safe_K)
+        + _default_shape_w * (dev_snack_v_dinner / safe_K)
+        + _default_shape_w * (dev_breakfast_v_bigger / safe_K)
+        + WEIGHT_USER_SHAPE * lpSum(dev_user_shape)
     )
 
     # ------------------------------------------------------------------
@@ -1017,7 +1167,9 @@ def _solve_lp_once(
     # (kcal_by_type/types/has_* were computed earlier, alongside the
     # objective's soft meal-shape terms — reused here as-is.)
     # ------------------------------------------------------------------
-    if has_breakfast and has_lunch and has_dinner and has_snack:
+    if user_shape:
+        pass  # client's meal sizes replace the default distribution caps
+    elif has_breakfast and has_lunch and has_dinner and has_snack:
         prob += kcal_by_type["snack"]     <= _snack_max     * total_K
         prob += kcal_by_type["breakfast"] <= _breakfast_max * total_K
         prob += kcal_by_type["dinner"] - kcal_by_type["lunch"] <= _dl_diff * kcal_by_type["lunch"]
@@ -1088,7 +1240,7 @@ def _solve_lp_once(
     #      no single meal type's solved kcal should ever approach 3x the
     #      day's own target.
     # ------------------------------------------------------------------
-    if hard_bounds:
+    if hard_bounds and not user_shape:
         if has_snack and has_lunch:
             prob += kcal_by_type["snack"] <= kcal_by_type["lunch"]
         if has_snack and has_dinner:
@@ -1180,6 +1332,7 @@ def optimize_subrecipes(
     reference_servings: Dict[Tuple[str, int], float] | None = None,
     max_movement_pct: float | None = None,
     user_id: str | None = None,
+    meal_sizes: Dict[str, Any] | None = None,
 ) -> Tuple[List[Dict[str, Any]], float | None, Dict[str, Any]]:
     """
     Given a dict of meals for one day and a daily macro target, determine the
@@ -1285,7 +1438,14 @@ def optimize_subrecipes(
 
     fine_eligible = _compute_fine_step_eligibility(all_subs)
     is_single_meal = len(recipes_by_meal) == 1
-    STEPS = (1.0, SERVING_STEP_FINE, "mixed_quarter")
+    meal_goals = resolve_meal_goals(
+        meal_sizes, {info.get("meal_type") for info in recipes_by_meal.values()}, kcal_t
+    )
+    # Whole servings first (simplest plates) — unless the client shaped
+    # their day: a "light" meal usually needs half/quarter servings to get
+    # small enough, and the ladder stops at the first step that fits the
+    # macros, so the finest step goes first.
+    STEPS = ("mixed_quarter", SERVING_STEP_FINE, 1.0) if meal_goals else (1.0, SERVING_STEP_FINE, "mixed_quarter")
 
     # Translate locked_subrecipe_servings (keyed by subrecipe_id — the only
     # thing a caller can know before all_subs exists) into index-keyed
@@ -1321,6 +1481,7 @@ def optimize_subrecipes(
         flat_fee=flat_fee,
         reference_servings=reference_units,
         max_movement_pct=max_movement_pct,
+        meal_goals=meal_goals,
     )
 
     # ------------------------------------------------------------------

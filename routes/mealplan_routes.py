@@ -6,6 +6,7 @@ from collections import defaultdict
 from utils.supabase_client import supabase
 from services.mealplan_service import (
     optimize_subrecipes,
+    meal_shape_report,
     apply_weekly_carryover,
     carryover_settings,
     update_cumulative_deviation,
@@ -114,6 +115,13 @@ def generate_meal_plan():
     # Optional, for reproducible tests only — production omits it so each
     # generate breaks near-ties differently (variety on regenerate).
     variety_seed     = data.get("variety_seed")
+    # Advanced planning v2 (experiment): Light/Normal/Big per meal type.
+    # meal_sizes = default for every day; meal_sizes_by_weekday ("0".."6",
+    # Mon=0) overrides it on those weekdays (day types / templates).
+    meal_sizes_default = data.get("meal_sizes") or None
+    meal_sizes_by_weekday = {
+        int(k): v for k, v in (data.get("meal_sizes_by_weekday") or {}).items() if v
+    }
 
     if not user_id:
         return jsonify({"error": "user_id is required"}), 400
@@ -407,8 +415,9 @@ def generate_meal_plan():
                 target_with_kcal, cumulative_deviation, **carryover_settings(len(recipes_by_meal))
             )
 
+        day_meal_sizes = meal_sizes_by_weekday.get(date.weekday(), meal_sizes_default)
         optimized_subs, loss, day_totals = optimize_subrecipes(
-            recipes_by_meal, day_target, user_id=user_id
+            recipes_by_meal, day_target, user_id=user_id, meal_sizes=day_meal_sizes
         )
 
         # Single bounded repair step (point 3): at most one extra solve,
@@ -428,6 +437,7 @@ def generate_meal_plan():
             recipe_lookup=recipe_lookup,
             trial_meal_types=repair_trial_types,
             user_id=user_id,
+            meal_sizes=day_meal_sizes,
         )
 
         if swapped_meal_key is not None:
@@ -516,6 +526,10 @@ def generate_meal_plan():
             # carryover-adjusted target forward instead of reverting to the
             # flat global target.
             "adjusted_target": day_target,
+            **({
+                "meal_sizes": day_meal_sizes,
+                "meal_shape": meal_shape_report(day_meal_sizes, meals_list, day_target.get("kcal") or 0),
+            } if day_meal_sizes else {}),
         })
 
     # ------------------------------------------------------------------

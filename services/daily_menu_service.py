@@ -1273,6 +1273,7 @@ def repair_day_if_needed(
     recipe_lookup: Dict[int, dict] | None = None,
     trial_meal_types: Tuple[str, ...] = ("dinner", "lunch"),
     user_id: str | None = None,
+    meal_sizes: Dict[str, str] | None = None,
 ) -> Tuple[Dict[str, dict], dict, str | None, List[Dict] | None, float | None]:
     """Fixed dinner-then-lunch repair (point 3): at most `len(trial_meal_
     types)` extra optimize_subrecipes calls (2 by default — never a third
@@ -1344,7 +1345,7 @@ def repair_day_if_needed(
             "recipe_id": alt,
             **({"recipe_name": alt_info.get("name"), "photo": alt_info.get("photo")} if alt_info else {}),
         }
-        candidate_subs, candidate_error, candidate_totals = optimize_subrecipes(candidate, macro_target, user_id=user_id)
+        candidate_subs, candidate_error, candidate_totals = optimize_subrecipes(candidate, macro_target, user_id=user_id, meal_sizes=meal_sizes)
 
         if not needs_repair(candidate_totals, macro_target):
             # Return the subrecipe breakdown (and error) from THIS solve

@@ -7,6 +7,7 @@ from utils.supabase_client import supabase
 from utils.event_logger import log_event
 from services.mealplan_service import (
     optimize_subrecipes,
+    meal_shape_report,
     apply_weekly_carryover,
     carryover_settings,
     update_cumulative_deviation,
@@ -433,6 +434,7 @@ def apply_changes_and_optimize(
         user_id=user_id,
         reference_servings=reference_servings,
         max_movement_pct=0.0 if reference_servings else None,
+        meal_sizes=day.get("meal_sizes"),
             )
         if reference_servings and day_totals.get("tolerance_used") == "SAFE_FALLBACK":
             optimized_subs, loss, day_totals = optimize_subrecipes(
@@ -440,6 +442,7 @@ def apply_changes_and_optimize(
                 adjusted_target,
                 allow_under_kcal=(reduce_macros_pct > 0),
                 user_id=user_id,
+                meal_sizes=day.get("meal_sizes"),
             )
 
         # Same fix as above: measure against the stable base target, not
@@ -506,6 +509,11 @@ def apply_changes_and_optimize(
             "adjusted_target": adjusted_target,
             "eating_out_meal_types": sorted(eating_out_set),
         }
+        if day.get("meal_sizes"):
+            updated_day["meal_sizes"] = day["meal_sizes"]
+            updated_day["meal_shape"] = meal_shape_report(
+                day["meal_sizes"], updated_meals, adjusted_target.get("kcal") or 0
+            )
 
         new_days.append(updated_day)
 
