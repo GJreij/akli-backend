@@ -122,6 +122,11 @@ def generate_meal_plan():
     meal_sizes_by_weekday = {
         int(k): v for k, v in (data.get("meal_sizes_by_weekday") or {}).items() if v
     }
+    # Same experiment: a different DAILY target on some weekdays (e.g.
+    # training days). {"0": {"kcal"?, "protein_g"?, "carbs_g"?, "fat_g"?}}
+    day_targets_by_weekday = {
+        int(k): v for k, v in (data.get("day_targets_by_weekday") or {}).items() if isinstance(v, dict) and v
+    }
 
     if not user_id:
         return jsonify({"error": "user_id is required"}), 400
@@ -291,6 +296,36 @@ def generate_meal_plan():
     }
     is_high_kcal = target_with_kcal["kcal"] > HIGH_KCAL_THRESHOLD
 
+    def _day_base_target(weekday: int) -> dict:
+        """The client's target for this weekday: their normal one, or a day
+        type's own totals. Only kcal -> grams scale with it; only grams ->
+        kcal follows them; missing grams keep their normal proportion.
+        Clamped to a sane range (800-6000 kcal) — never rejected."""
+        ov = day_targets_by_weekday.get(weekday)
+        if not ov:
+            return target_with_kcal
+        def num(k):
+            try:
+                v = float(ov.get(k)) if ov.get(k) is not None else None
+            except (TypeError, ValueError):
+                v = None
+            return v if v is not None and v >= 0 else None
+        kcal, P, C, F = num("kcal"), num("protein_g"), num("carbs_g"), num("fat_g")
+        base_k = target_with_kcal["kcal"] or 1.0
+        if kcal is None and any(x is not None for x in (P, C, F)):
+            P_ = P if P is not None else target_with_kcal["protein_g"]
+            C_ = C if C is not None else target_with_kcal["carbs_g"]
+            F_ = F if F is not None else target_with_kcal["fat_g"]
+            kcal = 4 * (P_ + C_) + 9 * F_
+        kcal = min(6000.0, max(800.0, kcal if kcal is not None else base_k))
+        ratio = kcal / base_k
+        return {
+            "protein_g": P if P is not None else target_with_kcal["protein_g"] * ratio,
+            "carbs_g":   C if C is not None else target_with_kcal["carbs_g"] * ratio,
+            "fat_g":     F if F is not None else target_with_kcal["fat_g"] * ratio,
+            "kcal":      kcal,
+        }
+
     # ------------------------------------------------------------------
     # 8. BATCH PREFETCH - all auxiliary DB lookups done here, once
     # ------------------------------------------------------------------
@@ -375,6 +410,7 @@ def generate_meal_plan():
             cumulative_deviation = {"protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0, "kcal": 0.0}
 
         allowed_ids_today = allowed_recipe_ids_by_date.get(date, set())
+        base_target = _day_base_target(date.weekday())
 
         # High-kcal clients bypass the shared template entirely (empty
         # template_for_date makes every slot go through personal
@@ -390,7 +426,7 @@ def generate_meal_plan():
             user_prefs=user_prefs,
             recipe_lookup=recipe_lookup,
             recipe_macros=recipe_macros,
-            macro_target=target_with_kcal,
+            macro_target=base_target,
             plan_counts=plan_counts,
             previous_day_recipes=previous_day_recipes,
             rng=rng,
@@ -409,10 +445,10 @@ def generate_meal_plan():
         # whatever the week has under/over-shot so far (capped at +/-25%
         # of that day's original target).
         if day_index == 0:
-            day_target = target_with_kcal
+            day_target = base_target
         else:
             day_target = apply_weekly_carryover(
-                target_with_kcal, cumulative_deviation, **carryover_settings(len(recipes_by_meal))
+                base_target, cumulative_deviation, **carryover_settings(len(recipes_by_meal))
             )
 
         day_meal_sizes = meal_sizes_by_weekday.get(date.weekday(), meal_sizes_default)
@@ -461,7 +497,7 @@ def generate_meal_plan():
         # data: a 22-weekday request pinned at +25% for the last 14 days
         # straight). Measuring against target_with_kcal breaks the loop.
         cumulative_deviation = update_cumulative_deviation(
-            cumulative_deviation, target_with_kcal, day_totals
+            cumulative_deviation, base_target, day_totals
         )
 
         if day_totals.get("tolerance_used") == "SAFE_FALLBACK":
@@ -526,9 +562,10 @@ def generate_meal_plan():
             # carryover-adjusted target forward instead of reverting to the
             # flat global target.
             "adjusted_target": day_target,
+            **({"day_target": base_target} if base_target is not target_with_kcal else {}),
             **({
                 "meal_sizes": day_meal_sizes,
-                "meal_shape": meal_shape_report(day_meal_sizes, meals_list, day_target.get("kcal") or 0),
+                "meal_shape": meal_shape_report(day_meal_sizes, meals_list, day_target),
             } if day_meal_sizes else {}),
         })
 

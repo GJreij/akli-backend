@@ -211,10 +211,37 @@ MEAL_SHAPE_MISS_FLOOR = {"kcal": 120, "protein": 10, "carbs": 15, "fat": 8}
 _MACRO_KCAL = {"protein": 4, "carbs": 4, "fat": 9}
 
 
+def _num(x):
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+
+def _clean_setting(v):
+    """Drop junk: non-numbers anywhere, and exact kcal/grams <= 0 (an empty
+    or zero box means 'not set', not 'zero calories'). % keeps 0 — it means
+    'as small as possible' and is lifted to MEAL_MIN_SHARE."""
+    if not isinstance(v, dict):
+        return v
+    out = {}
+    p = _num(v.get("pct"))
+    if p is not None:
+        out["pct"] = p
+        return out
+    for k in ("kcal", "protein", "carbs", "fat"):
+        n = _num(v.get(k))
+        if n is not None and n > 0:
+            out[k] = n
+    return out
+
+
 def _meal_mode(v) -> str:
     """'light' | 'normal' | 'big' | 'pct' | 'exact' for one meal's setting.
     A setting is either a size string, {"pct": 40}, or exact grams/kcal
     {"kcal"?, "protein"?, "carbs"?, "fat"?}."""
+    v = _clean_setting(v)
     if isinstance(v, str):
         return v if v in MEAL_SIZE_FACTOR else "normal"
     if isinstance(v, dict):
@@ -225,62 +252,109 @@ def _meal_mode(v) -> str:
     return "normal"
 
 
+# Every meal that's delivered keeps at least this share of the day — to skip
+# a meal the client turns it off in Meal types instead of asking for 0%.
+MEAL_MIN_SHARE = 0.05
+
+
 def resolve_meal_goals(
-    meal_sizes: Dict[str, Any] | None, present_types, day_kcal: float
+    meal_sizes: Dict[str, Any] | None, present_types, day_kcal: float,
+    day_macros: Dict[str, float] | None = None,
 ) -> Dict[str, Dict[str, Any]] | None:
     """Client meal settings -> absolute goals per present meal type:
     {type: {"kcal": x, "protein"?: g, "carbs"?: g, "fat"?: g, "mode": ...}}.
     Exact and % meals are fixed first; the calories left over are split
     between the remaining meals by base share x Light/Normal/Big factor.
+
+    Extremes are made sane here, never rejected:
+      - % values clamp to 0-100; if every meal has a % they're rescaled to
+        add up to 100; set %s are squeezed so every other meal keeps
+        MEAL_MIN_SHARE. 100% breakfast on a 3-meal day -> 90/5/5.
+      - exact kcal / grams clamp to the day's own target; fixed kcal is
+        squeezed the same way so the remaining meals keep their minimum.
+      - every meal ends with at least MEAL_MIN_SHARE of the day.
+      - all meals on the same size (all Big, all Light) = no change.
     None when nothing is set or the day has fewer than 2 meal types."""
     types = [t for t in MEAL_BASE_SHARE if t in set(present_types)]
-    if not meal_sizes or len(types) < 2 or day_kcal <= 0:
+    if not isinstance(meal_sizes, dict) or not meal_sizes or len(types) < 2 or day_kcal <= 0:
         return None
+    meal_sizes = {t: _clean_setting(v) for t, v in meal_sizes.items()}
     modes = {t: _meal_mode(meal_sizes.get(t)) for t in types}
     if all(m == "normal" for m in modes.values()):
         return None
+    if all(m in MEAL_SIZE_FACTOR for m in modes.values()) and len(set(modes.values())) == 1:
+        return None  # all Big / all Light: same proportions as automatic
+    day_macros = day_macros or {}
+    min_k = MEAL_MIN_SHARE * day_kcal
     goals: Dict[str, Dict[str, Any]] = {}
-    fixed_kcal = 0.0
+
+    # 1. % meals
+    pct = {t: min(100.0, max(0.0, float(meal_sizes[t]["pct"]))) for t in types if modes[t] == "pct"}
+    if pct and len(pct) == len(types) and sum(pct.values()) > 0:
+        total = sum(pct.values())
+        pct = {t: v * 100.0 / total for t, v in pct.items()}
+    for t, v in pct.items():
+        goals[t] = {"kcal": v / 100.0 * day_kcal, "mode": "pct"}
+
+    # 2. exact meals (kcal given, or all three macros given)
     for t in types:
-        v, m = meal_sizes.get(t), modes[t]
-        if m == "pct":
-            k = max(0.0, float(v["pct"])) / 100.0 * day_kcal
-            goals[t] = {"kcal": k, "mode": m}
-            fixed_kcal += k
-        elif m == "exact":
-            g = {k2: float(v[k2]) for k2 in ("protein", "carbs", "fat") if v.get(k2) is not None}
-            if v.get("kcal") is not None:
-                k = float(v["kcal"])
-            elif len(g) == 3:
-                k = sum(g[x] * _MACRO_KCAL[x] for x in g)
-            else:
-                # Only some macros set (e.g. "40 g protein"): those are
-                # goals, but the meal's calories come from the shared split.
-                goals[t] = {**g, "mode": m}
-                continue
-            goals[t] = {"kcal": k, **g, "mode": m}
-            fixed_kcal += k
-    rest = [t for t in types if "kcal" not in goals.get(t, {})]
+        if modes[t] != "exact":
+            continue
+        v = meal_sizes[t]
+        g = {}
+        for k2 in ("protein", "carbs", "fat"):
+            if v.get(k2) is not None:
+                cap = day_macros.get(f"{k2}_g") or float("inf")
+                g[k2] = min(max(0.0, float(v[k2])), cap)
+        if v.get("kcal") is not None:
+            k = min(max(0.0, float(v["kcal"])), day_kcal)
+        elif len(g) == 3:
+            k = min(sum(g[x] * _MACRO_KCAL[x] for x in g), day_kcal)
+        else:
+            # Only some macros set (e.g. "40 g protein"): those are goals,
+            # but the meal's calories come from the shared split below.
+            goals[t] = {**g, "mode": "exact"}
+            continue
+        goals[t] = {"kcal": k, **g, "mode": "exact"}
+
+    # 3. Squeeze fixed kcal so every other meal keeps its minimum, and
+    #    lift fixed meals to their own minimum.
+    fixed = [t for t in types if "kcal" in goals.get(t, {})]
+    rest = [t for t in types if t not in fixed]
+    for t in fixed:
+        goals[t]["kcal"] = max(goals[t]["kcal"], min_k)
+    room = day_kcal - len(rest) * min_k
+    fixed_sum = sum(goals[t]["kcal"] for t in fixed)
+    if rest and fixed_sum > room and fixed_sum > 0:
+        f = max(room, 0.0) / fixed_sum
+        for t in fixed:
+            goals[t]["kcal"] = max(min_k, goals[t]["kcal"] * f)
+        fixed_sum = sum(goals[t]["kcal"] for t in fixed)
+
+    # 4. The rest share what's left by base share x size factor.
     if rest:
-        left = max(0.0, day_kcal - fixed_kcal)
+        left = max(day_kcal - fixed_sum, len(rest) * min_k)
         raw = {t: MEAL_BASE_SHARE[t] * MEAL_SIZE_FACTOR.get(modes[t], 1.0) for t in rest}
         tot = sum(raw.values()) or 1.0
         for t in rest:
-            goals.setdefault(t, {"mode": modes[t]})["kcal"] = left * raw[t] / tot
+            goals.setdefault(t, {"mode": modes[t]})["kcal"] = max(min_k, left * raw[t] / tot)
     return goals
 
 
 def meal_shape_report(
     meal_sizes: Dict[str, Any] | None,
     meals: List[Dict[str, Any]],
-    day_kcal_target: float,
+    day_target: Dict[str, float],
 ) -> List[Dict[str, Any]] | None:
     """Per meal: its mode, goals vs what the plan gives (kcal + any exact
     macros), and whether a meal the client changed missed. meals: the day's
     meals_list entries (meal_type + macros)."""
-    goals = resolve_meal_goals(meal_sizes, {m["meal_type"] for m in meals}, day_kcal_target)
+    goals = resolve_meal_goals(
+        meal_sizes, {m["meal_type"] for m in meals}, float(day_target.get("kcal") or 0), day_target
+    )
     if not goals:
         return None
+    meal_sizes = {t: _clean_setting(v) for t, v in meal_sizes.items()}
     got: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
     for m in meals:
         for k in ("kcal", "protein", "carbs", "fat"):
@@ -1439,7 +1513,8 @@ def optimize_subrecipes(
     fine_eligible = _compute_fine_step_eligibility(all_subs)
     is_single_meal = len(recipes_by_meal) == 1
     meal_goals = resolve_meal_goals(
-        meal_sizes, {info.get("meal_type") for info in recipes_by_meal.values()}, kcal_t
+        meal_sizes, {info.get("meal_type") for info in recipes_by_meal.values()}, kcal_t,
+        {"protein_g": P_t, "carbs_g": C_t, "fat_g": F_t},
     )
     # Whole servings first (simplest plates) — unless the client shaped
     # their day: a "light" meal usually needs half/quarter servings to get

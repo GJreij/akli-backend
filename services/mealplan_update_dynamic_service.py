@@ -232,6 +232,9 @@ def apply_changes_and_optimize(
             current_week_index = week_index
             cumulative_deviation = {"protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0, "kcal": 0.0}
 
+        # A day the client gave its own totals (Shape your day) keeps them.
+        day_base = day.get("day_target") or global_daily_target
+
         day_change = changes.get(date)
 
         # 1. Skip days explicitly deleted
@@ -247,9 +250,9 @@ def apply_changes_and_optimize(
             # 2026-08-18): a carryover-inflated adjusted_target used as
             # its own deviation baseline pins the target at the +/-25%
             # clamp for the rest of the plan once it's ever hit.
-            if global_daily_target and day.get("totals"):
+            if day_base and day.get("totals"):
                 cumulative_deviation = update_cumulative_deviation(
-                    cumulative_deviation, global_daily_target, day["totals"]
+                    cumulative_deviation, day_base, day["totals"]
                 )
             continue
         # 2. Track which meal types are currently excluded as "eating out"
@@ -374,7 +377,7 @@ def apply_changes_and_optimize(
             elif meal_type in ("lunch", "dinner"):
                 reduce_macros_pct += 0.40
 
-        adjusted_target = copy.deepcopy(global_daily_target)
+        adjusted_target = copy.deepcopy(day_base)
 
         if reduce_macros_pct > 0:
             pct = min(reduce_macros_pct, 1.0)
@@ -449,7 +452,7 @@ def apply_changes_and_optimize(
         # the carryover-adjusted (and possibly eating-out-reduced) one
         # that was actually solved against.
         cumulative_deviation = update_cumulative_deviation(
-            cumulative_deviation, global_daily_target, day_totals
+            cumulative_deviation, day_base, day_totals
         )
 
         if day_totals.get("tolerance_used") == "SAFE_FALLBACK":
@@ -509,10 +512,12 @@ def apply_changes_and_optimize(
             "adjusted_target": adjusted_target,
             "eating_out_meal_types": sorted(eating_out_set),
         }
+        if day.get("day_target"):
+            updated_day["day_target"] = day["day_target"]
         if day.get("meal_sizes"):
             updated_day["meal_sizes"] = day["meal_sizes"]
             updated_day["meal_shape"] = meal_shape_report(
-                day["meal_sizes"], updated_meals, adjusted_target.get("kcal") or 0
+                day["meal_sizes"], updated_meals, adjusted_target
             )
 
         new_days.append(updated_day)
