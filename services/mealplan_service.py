@@ -278,7 +278,10 @@ def resolve_meal_goals(
     types = [t for t in MEAL_BASE_SHARE if t in set(present_types)]
     if not isinstance(meal_sizes, dict) or not meal_sizes or len(types) < 2 or day_kcal <= 0:
         return None
-    meal_sizes = {t: _clean_setting(v) for t, v in meal_sizes.items()}
+    # "_rest": "even" -> meals without their own goal share what's left
+    # equally instead of in their usual proportions.
+    rest_even = meal_sizes.get("_rest") == "even"
+    meal_sizes = {t: _clean_setting(v) for t, v in meal_sizes.items() if t != "_rest"}
     modes = {t: _meal_mode(meal_sizes.get(t)) for t in types}
     if all(m == "normal" for m in modes.values()):
         return None
@@ -334,7 +337,7 @@ def resolve_meal_goals(
     # 4. The rest share what's left by base share x size factor.
     if rest:
         left = max(day_kcal - fixed_sum, len(rest) * min_k)
-        raw = {t: MEAL_BASE_SHARE[t] * MEAL_SIZE_FACTOR.get(modes[t], 1.0) for t in rest}
+        raw = {t: (1.0 if rest_even else MEAL_BASE_SHARE[t]) * MEAL_SIZE_FACTOR.get(modes[t], 1.0) for t in rest}
         tot = sum(raw.values()) or 1.0
         for t in rest:
             goals.setdefault(t, {"mode": modes[t]})["kcal"] = max(min_k, left * raw[t] / tot)
@@ -354,7 +357,7 @@ def meal_shape_report(
     )
     if not goals:
         return None
-    meal_sizes = {t: _clean_setting(v) for t, v in meal_sizes.items()}
+    meal_sizes = {t: _clean_setting(v) for t, v in meal_sizes.items() if t != "_rest"}
     got: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
     for m in meals:
         for k in ("kcal", "protein", "carbs", "fat"):
