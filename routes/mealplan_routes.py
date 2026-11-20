@@ -7,6 +7,7 @@ from utils.supabase_client import supabase
 from services.mealplan_service import (
     optimize_subrecipes,
     apply_weekly_carryover,
+    carryover_settings,
     update_cumulative_deviation,
     side_salad_options,
 )
@@ -402,7 +403,9 @@ def generate_meal_plan():
         if day_index == 0:
             day_target = target_with_kcal
         else:
-            day_target = apply_weekly_carryover(target_with_kcal, cumulative_deviation)
+            day_target = apply_weekly_carryover(
+                target_with_kcal, cumulative_deviation, **carryover_settings(len(recipes_by_meal))
+            )
 
         optimized_subs, loss, day_totals = optimize_subrecipes(
             recipes_by_meal, day_target, user_id=user_id

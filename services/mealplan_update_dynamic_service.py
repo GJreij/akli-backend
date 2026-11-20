@@ -8,6 +8,7 @@ from utils.event_logger import log_event
 from services.mealplan_service import (
     optimize_subrecipes,
     apply_weekly_carryover,
+    carryover_settings,
     update_cumulative_deviation,
     side_salad_options,
 )
@@ -387,7 +388,10 @@ def apply_changes_and_optimize(
         # 5b. Fold in weekly carry-over from prior days this week (capped at
         #     +/-25% of this day's own baseline target so a bad prior day
         #     can't wreck this day's culinary quality).
-        adjusted_target = apply_weekly_carryover(adjusted_target, cumulative_deviation)
+        #     Single-meal days skip it (see carryover_settings).
+        adjusted_target = apply_weekly_carryover(
+            adjusted_target, cumulative_deviation, **carryover_settings(len(updated_meals))
+        )
 
         # 6. Prepare recipes_by_meal for optimization
         recipes_by_meal: Dict[str, Dict[str, Any]] = {

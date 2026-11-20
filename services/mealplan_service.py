@@ -1578,6 +1578,24 @@ CARRYOVER_FRACTION = 0.5
 # from the original (un-adjusted) target for that day, in either direction.
 CARRYOVER_MAX_ADJUST_PCT = 0.25
 
+# Single-meal days (2026-11-20): carryover is OFF. With one meal a day the
+# client sees each dish on its own, so the same dish must arrive with the
+# same portions/macros every time it appears — carryover made it differ
+# day to day (real order: Tawouk Hummus Feast came as 51/93/17, 66/83/19,
+# 50/91/16 and 64/84/15 P/C/F across one plan), which reads as an error.
+# Each day is still solved against the client's real target with the normal
+# tolerance ladder, so an uncompensated miss stays a one-day miss instead of
+# compounding. Days with 2+ meals keep normal carryover.
+def carryover_settings(meals_per_day: int) -> Dict[str, float]:
+    """kwargs for apply_weekly_carryover, chosen by how many meals the day has."""
+    if meals_per_day <= 1:
+        return {"carryover_fraction": 0.0, "max_adjust_pct": 0.0}
+    return {
+        "carryover_fraction": CARRYOVER_FRACTION,
+        "max_adjust_pct": CARRYOVER_MAX_ADJUST_PCT,
+    }
+
+
 # Keys this function will adjust if present in macro_target / actual totals.
 _CARRYOVER_KEYS = ("protein_g", "carbs_g", "fat_g", "kcal")
 
