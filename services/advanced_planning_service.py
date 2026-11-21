@@ -190,6 +190,10 @@ def apply_changes(
         _recompute_day(day, subs_by_id)
         day["manual_servings"] = True
         target = day.get("adjusted_target") or plan.get("daily_macro_target") or {}
+        if day.get("meal_sizes"):
+            # Shaped day: re-judge each meal against its goal with the new servings.
+            from services.mealplan_service import meal_shape_report
+            day["meal_shape"] = meal_shape_report(day["meal_sizes"], day.get("meals") or [], target)
         day_totals_log.append({
             "date": date,
             "before": before,
