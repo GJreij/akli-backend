@@ -127,6 +127,12 @@ def generate_meal_plan():
     day_targets_by_weekday = {
         int(k): v for k, v in (data.get("day_targets_by_weekday") or {}).items() if isinstance(v, dict) and v
     }
+    # Same experiment: the day type's name per weekday ("Training", "Rest"),
+    # saved on daily_macro_order so the food diary can say which day it is.
+    day_labels_by_weekday = {
+        int(k): str(v).strip()[:24] for k, v in (data.get("day_labels_by_weekday") or {}).items()
+        if isinstance(v, str) and v.strip()
+    }
 
     if not user_id:
         return jsonify({"error": "user_id is required"}), 400
@@ -563,6 +569,7 @@ def generate_meal_plan():
             # flat global target.
             "adjusted_target": day_target,
             **({"day_target": base_target} if base_target is not target_with_kcal else {}),
+            **({"day_label": day_labels_by_weekday[date.weekday()]} if date.weekday() in day_labels_by_weekday else {}),
             **({
                 "meal_sizes": day_meal_sizes,
                 "meal_shape": meal_shape_report(day_meal_sizes, meals_list, day_target),

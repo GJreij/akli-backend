@@ -527,6 +527,10 @@ class OrderService:
         for day in days:
             meal_date_str = day["date"]
             totals = day.get("totals") or {}
+            # A day the client gave its own totals (Your day beta, e.g. a
+            # Training day) keeps that target so the food diary compares
+            # against it instead of the usual daily target. Null otherwise.
+            own = day.get("day_target") or {}
             dmo_payload.append(
                 {
                     "user_id": user_id,
@@ -539,6 +543,11 @@ class OrderService:
                     "saturated_fat_ordered": (totals.get("saturated") if "saturated" in totals else None),
                     "fiber_ordered": totals.get("fiber"),
                     "sugar_ordered": totals.get("sugar"),
+                    "kcal_target": own.get("kcal"),
+                    "protein_target": own.get("protein_g"),
+                    "carbs_target": own.get("carbs_g"),
+                    "fat_target": own.get("fat_g"),
+                    "day_label": (day.get("day_label") or None),
                     "created_at": now,
                 }
             )

@@ -514,6 +514,8 @@ def apply_changes_and_optimize(
         }
         if day.get("day_target"):
             updated_day["day_target"] = day["day_target"]
+        if day.get("day_label"):
+            updated_day["day_label"] = day["day_label"]
         if day.get("meal_sizes"):
             updated_day["meal_sizes"] = day["meal_sizes"]
             updated_day["meal_shape"] = meal_shape_report(
